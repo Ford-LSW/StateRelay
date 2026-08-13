@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.JsonNodeFactory;
 import com.staterelay.server.domain.TaskAttemptStatus;
+import com.staterelay.server.domain.TaskInstanceStatus;
 import org.springframework.jdbc.core.namedparam.MapSqlParameterSource;
 import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate;
 import org.springframework.transaction.support.TransactionTemplate;
@@ -37,16 +38,34 @@ public final class TaskAttemptRepository {
     }
 
     /**
-     * Reserves one Worker slot, advances the instance lease fence, and inserts its Attempt in
-     * one short transaction. A failed capacity guard leaves every write rolled back; a lease
-     * value returned by PostgreSQL is copied unchanged and is never synthesized or reused.
+     * Consumes the durable claim, reserves one Worker slot, advances the instance lease fence,
+     * and inserts its Attempt in one short transaction. A failed claim or capacity guard leaves
+     * every write rolled back; PostgreSQL supplies the monotonic lease value copied to the Attempt.
      */
     public Optional<AttemptLease> createAttemptWithCapacityReservation(
             UUID taskInstanceId,
+            UUID claimToken,
             UUID workerId,
             UUID workerEpoch,
             Instant leaseExpiresAt) {
+        Objects.requireNonNull(claimToken, "claimToken");
         return Objects.requireNonNull(transactions.execute(status -> {
+            List<Long> leases = jdbc.query("""
+                    UPDATE sr_task_instance
+                    SET current_lease_version = current_lease_version + 1,
+                        status = 'RUNNING', claim_token = NULL, claimed_at = NULL,
+                        updated_at = clock_timestamp()
+                    WHERE id = :instanceId
+                      AND status IN ('READY', 'RETRY_WAIT')
+                      AND claim_token = :claimToken
+                    RETURNING current_lease_version
+                    """, new MapSqlParameterSource()
+                    .addValue("instanceId", taskInstanceId)
+                    .addValue("claimToken", claimToken),
+                    (resultSet, rowNumber) -> resultSet.getLong("current_lease_version"));
+            if (leases.isEmpty()) {
+                return Optional.empty();
+            }
             int reserved = jdbc.update("""
                     UPDATE sr_worker
                     SET reserved_capacity = reserved_capacity + 1, updated_at = clock_timestamp()
@@ -59,22 +78,8 @@ public final class TaskAttemptRepository {
                     .addValue("workerId", workerId)
                     .addValue("workerEpoch", workerEpoch));
             if (reserved == 0) {
-                return Optional.empty();
-            }
-
-            List<Long> leases = jdbc.query("""
-                    UPDATE sr_task_instance
-                    SET current_lease_version = current_lease_version + 1,
-                        status = 'RUNNING', claim_token = NULL, claimed_at = NULL,
-                        updated_at = clock_timestamp()
-                    WHERE id = :instanceId
-                      AND status IN ('READY', 'RETRY_WAIT')
-                    RETURNING current_lease_version
-                    """, new MapSqlParameterSource("instanceId", taskInstanceId),
-                    (resultSet, rowNumber) -> resultSet.getLong("current_lease_version"));
-            if (leases.isEmpty()) {
                 status.setRollbackOnly();
-                throw new IllegalStateException("task instance is not eligible for an attempt");
+                return Optional.empty();
             }
             long leaseVersion = leases.get(0);
             int attemptNumber = jdbc.queryForObject("""
@@ -105,14 +110,40 @@ public final class TaskAttemptRepository {
                             .put("leaseVersion", leaseVersion)
                             .put("workerId", workerId.toString())
                             .put("workerEpoch", workerEpoch.toString()));
+            outbox.append("TASK_INSTANCE", taskInstanceId, "TASK_INSTANCE_STARTED",
+                    JsonNodeFactory.instance.objectNode()
+                            .put("taskInstanceId", taskInstanceId.toString())
+                            .put("attemptId", attemptId.toString())
+                            .put("leaseVersion", leaseVersion)
+                            .put("status", TaskInstanceStatus.RUNNING.name()));
             return Optional.of(new AttemptLease(
                     attemptId, taskInstanceId, attemptNumber, leaseVersion, workerId, workerEpoch));
         }));
     }
 
+    /**
+     * Compatibility entry point for callers that only carry the original Attempt fence. The
+     * remaining persisted identifiers are read, then revalidated by the fully fenced transaction.
+     */
     public boolean casCompleteAttempt(
             UUID attemptId, long leaseVersion, TaskAttemptStatus terminalStatus, JsonNode result) {
-        return complete(null, attemptId, leaseVersion, null, null, terminalStatus, result);
+        List<AttemptFence> fences = jdbc.query("""
+                SELECT task_instance_id, worker_id, worker_epoch
+                FROM sr_task_attempt
+                WHERE id = :attemptId AND lease_version = :leaseVersion
+                """, new MapSqlParameterSource()
+                .addValue("attemptId", attemptId)
+                .addValue("leaseVersion", leaseVersion),
+                (resultSet, rowNumber) -> new AttemptFence(
+                        resultSet.getObject("task_instance_id", UUID.class),
+                        resultSet.getObject("worker_id", UUID.class),
+                        resultSet.getObject("worker_epoch", UUID.class)));
+        if (fences.isEmpty()) {
+            return false;
+        }
+        AttemptFence fence = fences.get(0);
+        return complete(fence.taskInstanceId(), attemptId, leaseVersion, fence.workerId(),
+                fence.workerEpoch(), terminalStatus, defaultInstanceOutcome(terminalStatus), null, result);
     }
 
     /**
@@ -129,7 +160,26 @@ public final class TaskAttemptRepository {
             TaskAttemptStatus terminalStatus,
             JsonNode result) {
         return complete(
-                taskInstanceId, attemptId, leaseVersion, workerId, workerEpoch, terminalStatus, result);
+                taskInstanceId, attemptId, leaseVersion, workerId, workerEpoch, terminalStatus,
+                defaultInstanceOutcome(terminalStatus), null, result);
+    }
+
+    /**
+     * Applies a caller-decided persistence outcome without classifying retry policy here. The
+     * Attempt, Instance, Worker capacity, and both Outbox records commit or roll back together.
+     */
+    public boolean casCompleteAttempt(
+            UUID taskInstanceId,
+            UUID attemptId,
+            long leaseVersion,
+            UUID workerId,
+            UUID workerEpoch,
+            TaskAttemptStatus terminalStatus,
+            TaskInstanceStatus instanceOutcome,
+            Instant nextRunAt,
+            JsonNode result) {
+        return complete(taskInstanceId, attemptId, leaseVersion, workerId, workerEpoch,
+                terminalStatus, instanceOutcome, nextRunAt, result);
     }
 
     /**
@@ -143,6 +193,32 @@ public final class TaskAttemptRepository {
             UUID workerId,
             UUID workerEpoch) {
         return Boolean.TRUE.equals(transactions.execute(status -> {
+            List<UUID> instances = jdbc.query("""
+                    UPDATE sr_task_instance instance
+                    SET status = 'RETRY_WAIT', next_run_at = clock_timestamp(),
+                        updated_at = clock_timestamp()
+                    WHERE instance.id = :instanceId
+                      AND instance.current_lease_version = :leaseVersion
+                      AND instance.status = 'RUNNING'
+                      AND EXISTS (
+                          SELECT 1 FROM sr_task_attempt attempt
+                          WHERE attempt.id = :attemptId
+                            AND attempt.task_instance_id = instance.id
+                            AND attempt.lease_version = :leaseVersion
+                            AND attempt.worker_id = :workerId
+                            AND attempt.worker_epoch = :workerEpoch
+                            AND attempt.status IN ('ASSIGNED', 'ACCEPTED', 'RUNNING')
+                            AND attempt.capacity_released_at IS NULL)
+                      AND EXISTS (
+                          SELECT 1 FROM sr_worker worker
+                          WHERE worker.id = :workerId
+                            AND worker.worker_epoch = :workerEpoch)
+                    RETURNING instance.id
+                    """, fenceParameters(taskInstanceId, attemptId, leaseVersion, workerId, workerEpoch),
+                    (resultSet, rowNumber) -> resultSet.getObject("id", UUID.class));
+            if (instances.isEmpty()) {
+                return false;
+            }
             List<UUID> releasedWorkers = jdbc.query("""
                     UPDATE sr_task_attempt
                     SET status = 'LOST', finished_at = clock_timestamp(),
@@ -154,34 +230,26 @@ public final class TaskAttemptRepository {
                       AND worker_epoch = :workerEpoch
                       AND status IN ('ASSIGNED', 'ACCEPTED', 'RUNNING')
                       AND capacity_released_at IS NULL
-                      AND EXISTS (
-                          SELECT 1 FROM sr_task_instance instance
-                          WHERE instance.id = :instanceId
-                            AND instance.current_lease_version = :leaseVersion
-                            AND instance.status = 'RUNNING')
                     RETURNING worker_id
                     """, fenceParameters(taskInstanceId, attemptId, leaseVersion, workerId, workerEpoch),
                     (resultSet, rowNumber) -> resultSet.getObject("worker_id", UUID.class));
             if (releasedWorkers.isEmpty()) {
-                return false;
+                status.setRollbackOnly();
+                throw new IllegalStateException("attempt fence changed while marking instance retryable");
             }
-            jdbc.update("""
+            int capacityReleased = jdbc.update("""
                     UPDATE sr_worker
-                    SET reserved_capacity = GREATEST(reserved_capacity - 1, 0),
+                    SET reserved_capacity = reserved_capacity - 1,
                         updated_at = clock_timestamp()
                     WHERE id = :workerId AND worker_epoch = :workerEpoch
+                      AND reserved_capacity > 0
                     """, new MapSqlParameterSource()
                     .addValue("workerId", workerId)
                     .addValue("workerEpoch", workerEpoch));
-            jdbc.update("""
-                    UPDATE sr_task_instance
-                    SET status = 'RETRY_WAIT', next_run_at = clock_timestamp(), updated_at = clock_timestamp()
-                    WHERE id = :instanceId
-                      AND current_lease_version = :leaseVersion
-                      AND status = 'RUNNING'
-                    """, new MapSqlParameterSource()
-                    .addValue("instanceId", taskInstanceId)
-                    .addValue("leaseVersion", leaseVersion));
+            if (capacityReleased != 1) {
+                status.setRollbackOnly();
+                throw new IllegalStateException("worker capacity fence changed while marking attempt lost");
+            }
             outbox.append("TASK_ATTEMPT", attemptId, "TASK_ATTEMPT_LOST",
                     JsonNodeFactory.instance.objectNode()
                             .put("taskInstanceId", taskInstanceId.toString())
@@ -189,6 +257,12 @@ public final class TaskAttemptRepository {
                             .put("leaseVersion", leaseVersion)
                             .put("workerId", workerId.toString())
                             .put("workerEpoch", workerEpoch.toString()));
+            outbox.append("TASK_INSTANCE", taskInstanceId, "TASK_INSTANCE_STATE_CHANGED",
+                    JsonNodeFactory.instance.objectNode()
+                            .put("taskInstanceId", taskInstanceId.toString())
+                            .put("attemptId", attemptId.toString())
+                            .put("leaseVersion", leaseVersion)
+                            .put("status", TaskInstanceStatus.RETRY_WAIT.name()));
             return true;
         }));
     }
@@ -200,45 +274,90 @@ public final class TaskAttemptRepository {
             UUID workerId,
             UUID workerEpoch,
             TaskAttemptStatus terminalStatus,
+            TaskInstanceStatus instanceOutcome,
+            Instant nextRunAt,
             JsonNode result) {
         requireTerminal(terminalStatus);
+        requireOutcome(terminalStatus, instanceOutcome, nextRunAt);
         return Boolean.TRUE.equals(transactions.execute(status -> {
-            StringBuilder sql = new StringBuilder("""
+            List<UUID> instances = jdbc.query("""
+                    UPDATE sr_task_instance instance
+                    SET status = :instanceOutcome,
+                        next_run_at = CASE WHEN :instanceOutcome = 'RETRY_WAIT'
+                            THEN :nextRunAt ELSE next_run_at END,
+                        terminal_at = CASE WHEN :instanceOutcome IN ('SUCCESS', 'FAILED', 'CANCELLED')
+                            THEN clock_timestamp() ELSE NULL END,
+                        updated_at = clock_timestamp()
+                    WHERE instance.id = :instanceId
+                      AND instance.current_lease_version = :leaseVersion
+                      AND instance.status = 'RUNNING'
+                      AND EXISTS (
+                          SELECT 1 FROM sr_task_attempt attempt
+                          WHERE attempt.id = :attemptId
+                            AND attempt.task_instance_id = instance.id
+                            AND attempt.lease_version = :leaseVersion
+                            AND attempt.worker_id = :workerId
+                            AND attempt.worker_epoch = :workerEpoch
+                            AND attempt.status IN ('ACCEPTED', 'RUNNING')
+                            AND attempt.capacity_released_at IS NULL)
+                      AND EXISTS (
+                          SELECT 1 FROM sr_worker worker
+                          WHERE worker.id = :workerId
+                            AND worker.worker_epoch = :workerEpoch)
+                    RETURNING instance.id
+                    """, new MapSqlParameterSource()
+                    .addValue("instanceId", taskInstanceId)
+                    .addValue("attemptId", attemptId)
+                    .addValue("leaseVersion", leaseVersion)
+                    .addValue("workerId", workerId)
+                    .addValue("workerEpoch", workerEpoch)
+                    .addValue("instanceOutcome", instanceOutcome.name())
+                    .addValue("nextRunAt", nextRunAt == null ? null
+                            : nextRunAt.atOffset(ZoneOffset.UTC), Types.TIMESTAMP_WITH_TIMEZONE),
+                    (resultSet, rowNumber) -> resultSet.getObject("id", UUID.class));
+            if (instances.isEmpty()) {
+                return false;
+            }
+
+            List<UUID> releasedWorkers = jdbc.query("""
                     UPDATE sr_task_attempt
                     SET status = :terminalStatus, result = CAST(:result AS jsonb),
                         progress_percent = CASE WHEN :terminalStatus = 'SUCCESS' THEN 100 ELSE progress_percent END,
+                        capacity_released_at = clock_timestamp(),
                         finished_at = clock_timestamp(), updated_at = clock_timestamp()
                     WHERE id = :attemptId
+                      AND task_instance_id = :instanceId
                       AND lease_version = :leaseVersion
+                      AND worker_id = :workerId
+                      AND worker_epoch = :workerEpoch
                       AND status IN ('ACCEPTED', 'RUNNING')
-                    """);
-            MapSqlParameterSource parameters = new MapSqlParameterSource()
+                      AND capacity_released_at IS NULL
+                    RETURNING worker_id
+                    """, new MapSqlParameterSource()
+                    .addValue("instanceId", taskInstanceId)
                     .addValue("attemptId", attemptId)
                     .addValue("leaseVersion", leaseVersion)
+                    .addValue("workerId", workerId)
+                    .addValue("workerEpoch", workerEpoch)
                     .addValue("terminalStatus", terminalStatus.name())
-                    .addValue("result", write(result));
-            if (taskInstanceId != null) {
-                sql.append("""
-                         AND task_instance_id = :instanceId
-                         AND EXISTS (
-                             SELECT 1 FROM sr_task_instance instance
-                             WHERE instance.id = :instanceId
-                               AND instance.current_lease_version = :leaseVersion
-                               AND instance.status = 'RUNNING')
-                        """);
-                parameters.addValue("instanceId", taskInstanceId);
+                    .addValue("result", write(result)),
+                    (resultSet, rowNumber) -> resultSet.getObject("worker_id", UUID.class));
+            if (releasedWorkers.isEmpty()) {
+                status.setRollbackOnly();
+                throw new IllegalStateException("attempt fence changed while completing instance");
             }
-            if (workerId != null) {
-                sql.append(" AND worker_id = :workerId");
-                parameters.addValue("workerId", workerId);
-            }
-            if (workerEpoch != null) {
-                sql.append(" AND worker_epoch = :workerEpoch");
-                parameters.addValue("workerEpoch", workerEpoch);
-            }
-            int updated = jdbc.update(sql.toString(), parameters);
-            if (updated == 0) {
-                return false;
+            int capacityReleased = jdbc.update("""
+                    UPDATE sr_worker
+                    SET reserved_capacity = reserved_capacity - 1,
+                        updated_at = clock_timestamp()
+                    WHERE id = :workerId AND worker_epoch = :workerEpoch
+                      AND reserved_capacity > 0
+                    """, new MapSqlParameterSource()
+                    .addValue("workerId", workerId)
+                    .addValue("workerEpoch", workerEpoch));
+            if (capacityReleased != 1) {
+                status.setRollbackOnly();
+                throw new IllegalStateException("worker capacity fence changed while completing attempt");
             }
             var payload = JsonNodeFactory.instance.objectNode()
                     .put("attemptId", attemptId.toString())
@@ -254,8 +373,41 @@ public final class TaskAttemptRepository {
                 payload.put("workerEpoch", workerEpoch.toString());
             }
             outbox.append("TASK_ATTEMPT", attemptId, "TASK_ATTEMPT_COMPLETED", payload);
+            outbox.append("TASK_INSTANCE", taskInstanceId, "TASK_INSTANCE_STATE_CHANGED",
+                    JsonNodeFactory.instance.objectNode()
+                            .put("taskInstanceId", taskInstanceId.toString())
+                            .put("attemptId", attemptId.toString())
+                            .put("leaseVersion", leaseVersion)
+                            .put("status", instanceOutcome.name()));
             return true;
         }));
+    }
+
+    private TaskInstanceStatus defaultInstanceOutcome(TaskAttemptStatus terminalStatus) {
+        return switch (terminalStatus) {
+            case SUCCESS -> TaskInstanceStatus.SUCCESS;
+            case CANCELLED -> TaskInstanceStatus.CANCELLED;
+            case FAILED, TIMED_OUT -> TaskInstanceStatus.FAILED;
+            default -> throw new IllegalArgumentException("attempt completion requires a terminal report status");
+        };
+    }
+
+    private void requireOutcome(
+            TaskAttemptStatus attemptStatus, TaskInstanceStatus instanceOutcome, Instant nextRunAt) {
+        Objects.requireNonNull(instanceOutcome, "instanceOutcome");
+        boolean allowed = switch (attemptStatus) {
+            case SUCCESS -> instanceOutcome == TaskInstanceStatus.SUCCESS;
+            case CANCELLED -> instanceOutcome == TaskInstanceStatus.CANCELLED;
+            case FAILED, TIMED_OUT -> instanceOutcome == TaskInstanceStatus.FAILED
+                    || instanceOutcome == TaskInstanceStatus.RETRY_WAIT;
+            default -> false;
+        };
+        if (!allowed) {
+            throw new IllegalArgumentException("attempt and instance outcomes are inconsistent");
+        }
+        if ((instanceOutcome == TaskInstanceStatus.RETRY_WAIT) != (nextRunAt != null)) {
+            throw new IllegalArgumentException("nextRunAt is required only for RETRY_WAIT");
+        }
     }
 
     private MapSqlParameterSource fenceParameters(
@@ -275,7 +427,8 @@ public final class TaskAttemptRepository {
     private void requireTerminal(TaskAttemptStatus status) {
         if (status != TaskAttemptStatus.SUCCESS
                 && status != TaskAttemptStatus.FAILED
-                && status != TaskAttemptStatus.CANCELLED) {
+                && status != TaskAttemptStatus.CANCELLED
+                && status != TaskAttemptStatus.TIMED_OUT) {
             throw new IllegalArgumentException("attempt completion requires a terminal report status");
         }
     }
@@ -296,5 +449,8 @@ public final class TaskAttemptRepository {
             long leaseVersion,
             UUID workerId,
             UUID workerEpoch) {
+    }
+
+    private record AttemptFence(UUID taskInstanceId, UUID workerId, UUID workerEpoch) {
     }
 }

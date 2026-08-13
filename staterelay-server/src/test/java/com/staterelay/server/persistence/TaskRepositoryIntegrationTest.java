@@ -4,9 +4,12 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.JsonNodeFactory;
 import com.staterelay.server.domain.DispatchStatus;
 import com.staterelay.server.domain.TaskAttemptStatus;
+import com.staterelay.server.domain.TaskInstanceStatus;
 import com.staterelay.server.support.PostgresTestConfiguration;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.test.context.junit.jupiter.SpringJUnitConfig;
@@ -15,6 +18,9 @@ import org.springframework.transaction.support.TransactionTemplate;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.UUID;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -114,6 +120,32 @@ class TaskRepositoryIntegrationTest extends PostgresRepositoryTestSupport {
     }
 
     @Test
+    void successfulCompletionReleasesCapacityAndCompletesTheInstance() {
+        DefinitionFixture definition = definitionFixture();
+        WorkerFixture worker = workerFixture(definition.applicationId(), 1);
+        UUID instanceId = instanceRepository.createManualInstance(
+                definition.definitionId(), definition.versionId(), null,
+                Instant.parse("2026-08-13T10:00:00Z"), JsonNodeFactory.instance.objectNode());
+        UUID claimToken = claimToken(instanceId);
+        TaskAttemptRepository.AttemptLease attempt = attemptRepository.createAttemptWithCapacityReservation(
+                instanceId, claimToken, worker.workerId(), worker.workerEpoch(),
+                Instant.parse("2026-08-13T10:05:00Z")).orElseThrow();
+        jdbcTemplate.update("UPDATE sr_task_attempt SET status = 'RUNNING' WHERE id = ?", attempt.attemptId());
+
+        boolean completed = attemptRepository.casCompleteAttempt(
+                instanceId, attempt.attemptId(), attempt.leaseVersion(), worker.workerId(), worker.workerEpoch(),
+                TaskAttemptStatus.SUCCESS, JsonNodeFactory.instance.objectNode().put("ok", true));
+
+        assertThat(completed).isTrue();
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT reserved_capacity FROM sr_worker WHERE id = ?", Integer.class, worker.workerId()))
+                .isZero();
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT status FROM sr_task_instance WHERE id = ?", String.class, instanceId))
+                .isEqualTo("SUCCESS");
+    }
+
+    @Test
     void supersededInstanceLeaseCannotCompleteOrLoseAnOldActiveAttempt() {
         AttemptFixture fixture = runningAttempt(7);
         jdbcTemplate.update(
@@ -140,15 +172,16 @@ class TaskRepositoryIntegrationTest extends PostgresRepositoryTestSupport {
         UUID instanceId = instanceRepository.createManualInstance(
                 fixture.definitionId(), fixture.versionId(), null,
                 Instant.parse("2026-08-13T10:00:00Z"), JsonNodeFactory.instance.objectNode());
+        UUID firstClaimToken = claimToken(instanceId);
 
         TaskAttemptRepository.AttemptLease first = attemptRepository.createAttemptWithCapacityReservation(
-                instanceId, worker.workerId(), worker.workerEpoch(),
+                instanceId, firstClaimToken, worker.workerId(), worker.workerEpoch(),
                 Instant.parse("2026-08-13T10:05:00Z")).orElseThrow();
         attemptRepository.markAttemptLost(
                 instanceId, first.attemptId(), first.leaseVersion(), worker.workerId(), worker.workerEpoch());
-        jdbcTemplate.update("UPDATE sr_task_instance SET status = 'RETRY_WAIT' WHERE id = ?", instanceId);
+        UUID secondClaimToken = claimToken(instanceId);
         TaskAttemptRepository.AttemptLease second = attemptRepository.createAttemptWithCapacityReservation(
-                instanceId, worker.workerId(), worker.workerEpoch(),
+                instanceId, secondClaimToken, worker.workerId(), worker.workerEpoch(),
                 Instant.parse("2026-08-13T10:10:00Z")).orElseThrow();
 
         assertThat(first.attemptNumber()).isEqualTo(1);
@@ -167,8 +200,9 @@ class TaskRepositoryIntegrationTest extends PostgresRepositoryTestSupport {
         UUID instanceId = instanceRepository.createManualInstance(
                 fixture.definitionId(), fixture.versionId(), null,
                 Instant.parse("2026-08-13T10:00:00Z"), JsonNodeFactory.instance.objectNode());
+        UUID claimToken = claimToken(instanceId);
         TaskAttemptRepository.AttemptLease attempt = attemptRepository.createAttemptWithCapacityReservation(
-                instanceId, worker.workerId(), worker.workerEpoch(),
+                instanceId, claimToken, worker.workerId(), worker.workerEpoch(),
                 Instant.parse("2026-08-13T10:05:00Z")).orElseThrow();
 
         UUID dispatchId = dispatchRepository.createDispatch(
@@ -189,6 +223,233 @@ class TaskRepositoryIntegrationTest extends PostgresRepositoryTestSupport {
                 attempt.attemptId(), worker.workerId(), worker.workerEpoch(), "http://worker:8080",
                 Instant.parse("2026-08-13T10:00:01Z"), Instant.parse("2026-08-13T10:05:00Z")))
                 .isInstanceOf(DataIntegrityViolationException.class);
+    }
+
+    @Test
+    void attemptCreationRequiresAndConsumesTheDurableClaimToken() {
+        DefinitionFixture definition = definitionFixture();
+        WorkerFixture worker = workerFixture(definition.applicationId(), 2);
+        UUID instanceId = instanceRepository.createManualInstance(
+                definition.definitionId(), definition.versionId(), null,
+                Instant.parse("2026-08-13T10:00:00Z"), JsonNodeFactory.instance.objectNode());
+        UUID claimToken = claimToken(instanceId);
+        int outboxBefore = totalOutboxCount();
+
+        assertThat(attemptRepository.createAttemptWithCapacityReservation(
+                instanceId, UUID.randomUUID(), worker.workerId(), worker.workerEpoch(),
+                Instant.parse("2026-08-13T10:05:00Z"))).isEmpty();
+        assertThatThrownBy(() -> attemptRepository.createAttemptWithCapacityReservation(
+                instanceId, null, worker.workerId(), worker.workerEpoch(),
+                Instant.parse("2026-08-13T10:05:00Z")))
+                .isInstanceOf(NullPointerException.class);
+        assertReadyClaimState(instanceId, claimToken, worker.workerId(), 0, 0, outboxBefore);
+
+        TaskAttemptRepository.AttemptLease attempt = attemptRepository.createAttemptWithCapacityReservation(
+                instanceId, claimToken, worker.workerId(), worker.workerEpoch(),
+                Instant.parse("2026-08-13T10:05:00Z")).orElseThrow();
+
+        assertThat(attempt.leaseVersion()).isEqualTo(1);
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT claim_token IS NULL FROM sr_task_instance WHERE id = ?", Boolean.class, instanceId))
+                .isTrue();
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT reserved_capacity FROM sr_worker WHERE id = ?", Integer.class, worker.workerId()))
+                .isOne();
+        assertThat(outboxCount("TASK_ATTEMPT_CREATED", attempt.attemptId())).isOne();
+        assertThat(outboxCount("TASK_INSTANCE_STARTED", instanceId)).isOne();
+        assertThat(attemptRepository.createAttemptWithCapacityReservation(
+                instanceId, claimToken, worker.workerId(), worker.workerEpoch(),
+                Instant.parse("2026-08-13T10:05:00Z"))).isEmpty();
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT reserved_capacity FROM sr_worker WHERE id = ?", Integer.class, worker.workerId()))
+                .isOne();
+    }
+
+    @Test
+    void concurrentConsumersCannotSpendTheSameClaimTokenTwice() throws Exception {
+        DefinitionFixture definition = definitionFixture();
+        WorkerFixture worker = workerFixture(definition.applicationId(), 2);
+        UUID instanceId = instanceRepository.createManualInstance(
+                definition.definitionId(), definition.versionId(), null,
+                Instant.parse("2026-08-13T10:00:00Z"), JsonNodeFactory.instance.objectNode());
+        UUID claimToken = claimToken(instanceId);
+        CountDownLatch start = new CountDownLatch(1);
+        var executor = Executors.newFixedThreadPool(2);
+        try {
+            var first = executor.submit(() -> {
+                start.await(10, TimeUnit.SECONDS);
+                return attemptRepository.createAttemptWithCapacityReservation(
+                        instanceId, claimToken, worker.workerId(), worker.workerEpoch(),
+                        Instant.parse("2026-08-13T10:05:00Z"));
+            });
+            var second = executor.submit(() -> {
+                start.await(10, TimeUnit.SECONDS);
+                return attemptRepository.createAttemptWithCapacityReservation(
+                        instanceId, claimToken, worker.workerId(), worker.workerEpoch(),
+                        Instant.parse("2026-08-13T10:05:00Z"));
+            });
+            start.countDown();
+
+            assertThat(java.util.stream.Stream.of(
+                            first.get(30, TimeUnit.SECONDS), second.get(30, TimeUnit.SECONDS))
+                    .filter(java.util.Optional::isPresent)).hasSize(1);
+        } finally {
+            executor.shutdownNow();
+        }
+        assertThat(reservedCapacity(worker.workerId())).isOne();
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT count(*) FROM sr_task_attempt WHERE task_instance_id = ?", Integer.class, instanceId))
+                .isOne();
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT count(*) FROM sr_outbox_event WHERE event_type = 'TASK_ATTEMPT_CREATED'",
+                Integer.class)).isOne();
+    }
+
+    @Test
+    void unavailableCapacityDoesNotConsumeClaimOrAdvanceLeaseOrWriteOutbox() {
+        DefinitionFixture definition = definitionFixture();
+        WorkerFixture worker = workerFixture(definition.applicationId(), 1);
+        jdbcTemplate.update("UPDATE sr_worker SET reserved_capacity = 1 WHERE id = ?", worker.workerId());
+        UUID instanceId = instanceRepository.createManualInstance(
+                definition.definitionId(), definition.versionId(), null,
+                Instant.parse("2026-08-13T10:00:00Z"), JsonNodeFactory.instance.objectNode());
+        UUID claimToken = claimToken(instanceId);
+        int outboxBefore = totalOutboxCount();
+
+        assertThat(attemptRepository.createAttemptWithCapacityReservation(
+                instanceId, claimToken, worker.workerId(), worker.workerEpoch(),
+                Instant.parse("2026-08-13T10:05:00Z"))).isEmpty();
+
+        assertReadyClaimState(instanceId, claimToken, worker.workerId(), 0, 1, outboxBefore);
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT current_lease_version FROM sr_task_instance WHERE id = ?", Long.class, instanceId))
+                .isZero();
+    }
+
+    @ParameterizedTest
+    @CsvSource({
+            "SUCCESS, SUCCESS",
+            "FAILED, FAILED",
+            "CANCELLED, CANCELLED",
+            "TIMED_OUT, FAILED"
+    })
+    void terminalCompletionMapsOutcomeReleasesCapacityExactlyOnceAndWritesBothOutboxEvents(
+            TaskAttemptStatus attemptOutcome, TaskInstanceStatus instanceOutcome) {
+        ClaimedAttempt fixture = claimedRunningAttempt(1);
+
+        boolean completed = attemptRepository.casCompleteAttempt(
+                fixture.instanceId(), fixture.attemptId(), fixture.leaseVersion(),
+                fixture.workerId(), fixture.workerEpoch(), attemptOutcome, instanceOutcome, null,
+                JsonNodeFactory.instance.objectNode());
+        boolean duplicate = attemptRepository.casCompleteAttempt(
+                fixture.instanceId(), fixture.attemptId(), fixture.leaseVersion(),
+                fixture.workerId(), fixture.workerEpoch(), attemptOutcome, instanceOutcome, null,
+                JsonNodeFactory.instance.objectNode());
+
+        assertThat(completed).isTrue();
+        assertThat(duplicate).isFalse();
+        assertThat(attemptStatus(fixture.attemptId())).isEqualTo(attemptOutcome.name());
+        assertThat(instanceStatus(fixture.instanceId())).isEqualTo(instanceOutcome.name());
+        assertThat(reservedCapacity(fixture.workerId())).isZero();
+        assertThat(capacityReleased(fixture.attemptId())).isTrue();
+        assertThat(outboxCount("TASK_ATTEMPT_COMPLETED", fixture.attemptId())).isOne();
+        assertThat(outboxCount("TASK_INSTANCE_STATE_CHANGED", fixture.instanceId())).isOne();
+    }
+
+    @Test
+    void retryableFailureReturnsInstanceToRetryWaitAtTheSuppliedTime() {
+        ClaimedAttempt fixture = claimedRunningAttempt(2);
+        Instant nextRunAt = Instant.parse("2026-08-13T10:30:00Z");
+
+        boolean completed = attemptRepository.casCompleteAttempt(
+                fixture.instanceId(), fixture.attemptId(), fixture.leaseVersion(),
+                fixture.workerId(), fixture.workerEpoch(), TaskAttemptStatus.FAILED,
+                TaskInstanceStatus.RETRY_WAIT, nextRunAt, JsonNodeFactory.instance.objectNode());
+
+        assertThat(completed).isTrue();
+        assertThat(instanceStatus(fixture.instanceId())).isEqualTo("RETRY_WAIT");
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT next_run_at FROM sr_task_instance WHERE id = ?", java.time.OffsetDateTime.class,
+                fixture.instanceId()).toInstant()).isEqualTo(nextRunAt);
+        assertThat(reservedCapacity(fixture.workerId())).isZero();
+    }
+
+    @Test
+    void failedCompletionFenceLeavesAttemptInstanceWorkerAndOutboxUnchanged() {
+        ClaimedAttempt fixture = claimedRunningAttempt(1);
+        int outboxBefore = totalOutboxCount();
+
+        boolean completed = attemptRepository.casCompleteAttempt(
+                fixture.instanceId(), fixture.attemptId(), fixture.leaseVersion(),
+                fixture.workerId(), UUID.randomUUID(), TaskAttemptStatus.SUCCESS,
+                TaskInstanceStatus.SUCCESS, null, JsonNodeFactory.instance.objectNode());
+
+        assertThat(completed).isFalse();
+        assertThat(attemptStatus(fixture.attemptId())).isEqualTo("RUNNING");
+        assertThat(instanceStatus(fixture.instanceId())).isEqualTo("RUNNING");
+        assertThat(reservedCapacity(fixture.workerId())).isOne();
+        assertThat(capacityReleased(fixture.attemptId())).isFalse();
+        assertThat(totalOutboxCount()).isEqualTo(outboxBefore);
+    }
+
+    @Test
+    void rotatedWorkerEpochInvalidatesCompletionWithoutAnySideEffect() {
+        ClaimedAttempt fixture = claimedRunningAttempt(1);
+        int outboxBefore = totalOutboxCount();
+        jdbcTemplate.update(
+                "UPDATE sr_worker SET worker_epoch = ? WHERE id = ?", UUID.randomUUID(), fixture.workerId());
+
+        boolean completed = attemptRepository.casCompleteAttempt(
+                fixture.instanceId(), fixture.attemptId(), fixture.leaseVersion(),
+                fixture.workerId(), fixture.workerEpoch(), TaskAttemptStatus.SUCCESS,
+                TaskInstanceStatus.SUCCESS, null, JsonNodeFactory.instance.objectNode());
+
+        assertThat(completed).isFalse();
+        assertThat(attemptStatus(fixture.attemptId())).isEqualTo("RUNNING");
+        assertThat(instanceStatus(fixture.instanceId())).isEqualTo("RUNNING");
+        assertThat(reservedCapacity(fixture.workerId())).isOne();
+        assertThat(totalOutboxCount()).isEqualTo(outboxBefore);
+    }
+
+    @Test
+    void completionRollsBackEveryMutationWhenResultViolatesDatabaseConstraint() {
+        ClaimedAttempt fixture = claimedRunningAttempt(1);
+        int outboxBefore = totalOutboxCount();
+        String oversized = "x".repeat(65_537);
+
+        assertThatThrownBy(() -> attemptRepository.casCompleteAttempt(
+                fixture.instanceId(), fixture.attemptId(), fixture.leaseVersion(),
+                fixture.workerId(), fixture.workerEpoch(), TaskAttemptStatus.SUCCESS,
+                TaskInstanceStatus.SUCCESS, null,
+                JsonNodeFactory.instance.objectNode().put("result", oversized)))
+                .isInstanceOf(DataIntegrityViolationException.class);
+
+        assertThat(attemptStatus(fixture.attemptId())).isEqualTo("RUNNING");
+        assertThat(instanceStatus(fixture.instanceId())).isEqualTo("RUNNING");
+        assertThat(reservedCapacity(fixture.workerId())).isOne();
+        assertThat(capacityReleased(fixture.attemptId())).isFalse();
+        assertThat(totalOutboxCount()).isEqualTo(outboxBefore);
+    }
+
+    @Test
+    void lostAttemptReleasesCapacityExactlyOnceAndKeepsRetryTransitionAtomic() {
+        ClaimedAttempt fixture = claimedRunningAttempt(1);
+
+        boolean lost = attemptRepository.markAttemptLost(
+                fixture.instanceId(), fixture.attemptId(), fixture.leaseVersion(),
+                fixture.workerId(), fixture.workerEpoch());
+        boolean duplicate = attemptRepository.markAttemptLost(
+                fixture.instanceId(), fixture.attemptId(), fixture.leaseVersion(),
+                fixture.workerId(), fixture.workerEpoch());
+
+        assertThat(lost).isTrue();
+        assertThat(duplicate).isFalse();
+        assertThat(attemptStatus(fixture.attemptId())).isEqualTo("LOST");
+        assertThat(instanceStatus(fixture.instanceId())).isEqualTo("RETRY_WAIT");
+        assertThat(reservedCapacity(fixture.workerId())).isZero();
+        assertThat(capacityReleased(fixture.attemptId())).isTrue();
+        assertThat(outboxCount("TASK_ATTEMPT_LOST", fixture.attemptId())).isOne();
+        assertThat(outboxCount("TASK_INSTANCE_STATE_CHANGED", fixture.instanceId())).isOne();
     }
 
     @Test
@@ -234,12 +495,70 @@ class TaskRepositoryIntegrationTest extends PostgresRepositoryTestSupport {
                 Instant.parse("2026-08-13T10:05:00Z").atOffset(ZoneOffset.UTC),
                 Instant.parse("2026-08-13T10:00:01Z").atOffset(ZoneOffset.UTC),
                 Instant.parse("2026-08-13T10:00:02Z").atOffset(ZoneOffset.UTC));
+        jdbcTemplate.update(
+                "UPDATE sr_worker SET reserved_capacity = 1 WHERE id = ?", worker.workerId());
         return new AttemptFixture(instanceId, attemptId, worker.workerId(), worker.workerEpoch());
     }
 
     private String attemptStatus(UUID attemptId) {
         return jdbcTemplate.queryForObject(
                 "SELECT status FROM sr_task_attempt WHERE id = ?", String.class, attemptId);
+    }
+
+    private ClaimedAttempt claimedRunningAttempt(int workerCapacity) {
+        DefinitionFixture definition = definitionFixture();
+        WorkerFixture worker = workerFixture(definition.applicationId(), workerCapacity);
+        UUID instanceId = instanceRepository.createManualInstance(
+                definition.definitionId(), definition.versionId(), null,
+                Instant.parse("2026-08-13T10:00:00Z"), JsonNodeFactory.instance.objectNode());
+        UUID claimToken = claimToken(instanceId);
+        TaskAttemptRepository.AttemptLease attempt = attemptRepository.createAttemptWithCapacityReservation(
+                instanceId, claimToken, worker.workerId(), worker.workerEpoch(),
+                Instant.parse("2026-08-13T10:05:00Z")).orElseThrow();
+        jdbcTemplate.update("UPDATE sr_task_attempt SET status = 'RUNNING' WHERE id = ?", attempt.attemptId());
+        return new ClaimedAttempt(instanceId, attempt.attemptId(), attempt.leaseVersion(),
+                worker.workerId(), worker.workerEpoch());
+    }
+
+    private UUID claimToken(UUID instanceId) {
+        return instanceRepository.claimReadyBatch(Instant.now().plusSeconds(3_600), 10).stream()
+                .filter(claim -> claim.instanceId().equals(instanceId))
+                .findFirst()
+                .orElseThrow()
+                .claimToken();
+    }
+
+    private void assertReadyClaimState(
+            UUID instanceId, UUID claimToken, UUID workerId, int attempts, int capacity, int outboxCount) {
+        assertThat(instanceStatus(instanceId)).isEqualTo("READY");
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT claim_token FROM sr_task_instance WHERE id = ?", UUID.class, instanceId))
+                .isEqualTo(claimToken);
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT count(*) FROM sr_task_attempt WHERE task_instance_id = ?", Integer.class, instanceId))
+                .isEqualTo(attempts);
+        assertThat(reservedCapacity(workerId)).isEqualTo(capacity);
+        assertThat(totalOutboxCount()).isEqualTo(outboxCount);
+    }
+
+    private String instanceStatus(UUID instanceId) {
+        return jdbcTemplate.queryForObject(
+                "SELECT status FROM sr_task_instance WHERE id = ?", String.class, instanceId);
+    }
+
+    private int reservedCapacity(UUID workerId) {
+        return jdbcTemplate.queryForObject(
+                "SELECT reserved_capacity FROM sr_worker WHERE id = ?", Integer.class, workerId);
+    }
+
+    private boolean capacityReleased(UUID attemptId) {
+        return Boolean.TRUE.equals(jdbcTemplate.queryForObject(
+                "SELECT capacity_released_at IS NOT NULL FROM sr_task_attempt WHERE id = ?",
+                Boolean.class, attemptId));
+    }
+
+    private int totalOutboxCount() {
+        return jdbcTemplate.queryForObject("SELECT count(*) FROM sr_outbox_event", Integer.class);
     }
 
     private void insertAttemptInvariantViolation(
@@ -267,5 +586,9 @@ class TaskRepositoryIntegrationTest extends PostgresRepositoryTestSupport {
 
     private record AttemptFixture(
             UUID instanceId, UUID attemptId, UUID workerId, UUID workerEpoch) {
+    }
+
+    private record ClaimedAttempt(
+            UUID instanceId, UUID attemptId, long leaseVersion, UUID workerId, UUID workerEpoch) {
     }
 }
