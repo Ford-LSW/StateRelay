@@ -1,8 +1,8 @@
 .superpowers/
+sdd-workspace/
 .worktrees/
 target/
 .idea/
 .vscode/
 *.iml
 *.log
-
