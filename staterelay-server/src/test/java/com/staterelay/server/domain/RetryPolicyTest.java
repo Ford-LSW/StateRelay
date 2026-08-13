@@ -6,6 +6,7 @@ import java.time.Instant;
 import org.junit.jupiter.api.Test;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatIllegalArgumentException;
 
 class RetryPolicyTest {
 
@@ -36,5 +37,45 @@ class RetryPolicyTest {
 
         assertThat(policy.decide(20, ErrorClass.TRANSIENT, now).nextRunAt())
                 .isEqualTo(now.plus(Duration.ofMinutes(2)));
+    }
+
+    @Test
+    void injectedJitterSupplierProducesBoundedDelays() {
+        Instant now = Instant.parse("2026-08-13T10:00:00Z");
+
+        assertThat(new RetryPolicy(2, Duration.ofSeconds(10), Duration.ofMinutes(2), 0.2, () -> 0.0)
+                .decide(1, ErrorClass.TRANSIENT, now).nextRunAt())
+                .isEqualTo(now.plusSeconds(8));
+        assertThat(new RetryPolicy(2, Duration.ofSeconds(10), Duration.ofMinutes(2), 0.2, () -> 0.5)
+                .decide(1, ErrorClass.TRANSIENT, now).nextRunAt())
+                .isEqualTo(now.plusSeconds(10));
+        assertThat(new RetryPolicy(2, Duration.ofSeconds(10), Duration.ofMinutes(2), 0.2, () -> 1.0)
+                .decide(1, ErrorClass.TRANSIENT, now).nextRunAt())
+                .isEqualTo(now.plusSeconds(12));
+    }
+
+    @Test
+    void rejectsNonFiniteAndOutOfRangeJitterRatios() {
+        assertThatIllegalArgumentException().isThrownBy(() ->
+                new RetryPolicy(2, Duration.ofSeconds(1), Duration.ofSeconds(2), Double.NaN));
+        assertThatIllegalArgumentException().isThrownBy(() ->
+                new RetryPolicy(2, Duration.ofSeconds(1), Duration.ofSeconds(2), Double.POSITIVE_INFINITY));
+        assertThatIllegalArgumentException().isThrownBy(() ->
+                new RetryPolicy(2, Duration.ofSeconds(1), Duration.ofSeconds(2), Double.NEGATIVE_INFINITY));
+        assertThatIllegalArgumentException().isThrownBy(() ->
+                new RetryPolicy(2, Duration.ofSeconds(1), Duration.ofSeconds(2), -0.01));
+        assertThatIllegalArgumentException().isThrownBy(() ->
+                new RetryPolicy(2, Duration.ofSeconds(1), Duration.ofSeconds(2), 1.01));
+    }
+
+    @Test
+    void capsHugeDurationsBeforeOverflowingExponentialOrNanosecondCalculations() {
+        Duration baseDelay = Duration.ofDays(365L * 400);
+        Duration maxDelay = Duration.ofDays(365L * 500);
+        RetryPolicy policy = new RetryPolicy(30, baseDelay, maxDelay, 0.5, () -> 1.0);
+        Instant now = Instant.parse("2026-08-13T10:00:00Z");
+
+        assertThat(policy.decide(20, ErrorClass.TRANSIENT, now).nextRunAt())
+                .isEqualTo(now.plus(maxDelay));
     }
 }

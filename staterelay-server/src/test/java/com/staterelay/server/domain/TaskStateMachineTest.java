@@ -2,6 +2,8 @@ package com.staterelay.server.domain;
 
 import org.junit.jupiter.api.Test;
 
+import java.util.EnumSet;
+
 import static com.staterelay.server.domain.TaskAttemptStatus.ACCEPTED;
 import static com.staterelay.server.domain.TaskAttemptStatus.RUNNING;
 import static com.staterelay.server.domain.TaskAttemptStatus.SUCCESS;
@@ -39,6 +41,9 @@ class TaskStateMachineTest {
                 attemptStateMachine.requireTransition(ACCEPTED, TIMED_OUT));
         assertThatNoException().isThrownBy(() ->
                 attemptStateMachine.requireTransition(RUNNING, TIMED_OUT));
+        EnumSet.complementOf(EnumSet.of(ACCEPTED, RUNNING)).forEach(status ->
+                assertThatThrownBy(() -> attemptStateMachine.requireTransition(status, TIMED_OUT))
+                        .isInstanceOf(IllegalStateException.class));
         assertThatThrownBy(() ->
                 attemptStateMachine.requireTransition(TIMED_OUT, RUNNING))
                 .isInstanceOf(IllegalStateException.class);
