@@ -12,7 +12,7 @@ import java.sql.Types;
 import java.time.ZoneOffset;
 import java.util.UUID;
 
-abstract class PostgresRepositoryTestSupport {
+public abstract class PostgresRepositoryTestSupport {
 
     @Autowired
     protected JdbcTemplate jdbcTemplate;
@@ -21,7 +21,7 @@ abstract class PostgresRepositoryTestSupport {
     protected NamedParameterJdbcTemplate jdbc;
 
     @BeforeEach
-    void truncateDatabase() {
+    protected void truncateDatabase() {
         jdbcTemplate.execute("""
                 TRUNCATE TABLE sr_audit_event, sr_outbox_event, sr_dispatch, sr_task_attempt,
                     sr_task_instance, sr_trigger, sr_task_definition_version, sr_task_definition,

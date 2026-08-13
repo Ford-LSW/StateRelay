@@ -33,7 +33,7 @@ class MigrationSmokeTest {
     @Test
     void migrationBuildsAllPersistenceInvariantsAndIsIdempotent() {
         flyway.clean();
-        assertThat(flyway.migrate().migrationsExecuted).isEqualTo(1);
+        assertThat(flyway.migrate().migrationsExecuted).isEqualTo(2);
         flyway.validate();
 
         assertThat(jdbcTemplate.queryForList("""

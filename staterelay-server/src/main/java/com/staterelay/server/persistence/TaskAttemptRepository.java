@@ -6,6 +6,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.JsonNodeFactory;
 import com.staterelay.server.domain.TaskAttemptStatus;
 import com.staterelay.server.domain.TaskInstanceStatus;
+import com.staterelay.server.trigger.FixedDelayScheduleCoordinator;
 import org.springframework.jdbc.core.namedparam.MapSqlParameterSource;
 import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate;
 import org.springframework.transaction.support.TransactionTemplate;
@@ -25,16 +26,27 @@ public final class TaskAttemptRepository {
     private final TransactionTemplate transactions;
     private final OutboxRepository outbox;
     private final ObjectMapper objectMapper;
+    private final FixedDelayScheduleCoordinator fixedDelaySchedules;
 
     public TaskAttemptRepository(
             NamedParameterJdbcTemplate jdbc,
             TransactionTemplate transactions,
             OutboxRepository outbox,
             ObjectMapper objectMapper) {
+        this(jdbc, transactions, outbox, objectMapper, new FixedDelayScheduleCoordinator(jdbc));
+    }
+
+    public TaskAttemptRepository(
+            NamedParameterJdbcTemplate jdbc,
+            TransactionTemplate transactions,
+            OutboxRepository outbox,
+            ObjectMapper objectMapper,
+            FixedDelayScheduleCoordinator fixedDelaySchedules) {
         this.jdbc = jdbc;
         this.transactions = transactions;
         this.outbox = outbox;
         this.objectMapper = objectMapper;
+        this.fixedDelaySchedules = fixedDelaySchedules;
     }
 
     /**
@@ -379,6 +391,11 @@ public final class TaskAttemptRepository {
                             .put("attemptId", attemptId.toString())
                             .put("leaseVersion", leaseVersion)
                             .put("status", instanceOutcome.name()));
+            if (instanceOutcome == TaskInstanceStatus.SUCCESS
+                    || instanceOutcome == TaskInstanceStatus.FAILED
+                    || instanceOutcome == TaskInstanceStatus.CANCELLED) {
+                fixedDelaySchedules.scheduleAfterTerminal(taskInstanceId);
+            }
             return true;
         }));
     }
