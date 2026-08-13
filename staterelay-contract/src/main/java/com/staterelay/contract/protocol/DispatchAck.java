@@ -1,5 +1,12 @@
 package com.staterelay.contract.protocol;
 
+/**
+ * Worker's response to an {@link ExecuteTaskCommand}.
+ *
+ * <p>The acknowledgement identifies the dispatch and fenced attempt so the
+ * scheduler can distinguish acceptance, idempotent retransmission, capacity or
+ * handler rejection, and commands addressed to a stale Worker epoch.</p>
+ */
 public record DispatchAck(
         String dispatchId,
         String attemptId,
@@ -8,6 +15,9 @@ public record DispatchAck(
         AckStatus status,
         String message) {
 
+    /**
+     * Outcome of handling one dispatch command.
+     */
     public enum AckStatus {
         ACCEPTED,
         DUPLICATE,
