@@ -97,7 +97,9 @@ public final class TaskAttemptRepository {
             }
             int reserved = jdbc.update("""
                     UPDATE sr_worker
-                    SET reserved_capacity = reserved_capacity + 1, updated_at = clock_timestamp()
+                    SET reserved_capacity = GREATEST(
+                            reserved_capacity, reported_active_count) + 1,
+                        updated_at = clock_timestamp()
                     WHERE id = :workerId
                       AND worker_epoch = :workerEpoch
                       AND status = 'READY'
@@ -313,16 +315,7 @@ public final class TaskAttemptRepository {
                 status.setRollbackOnly();
                 throw new IllegalStateException("attempt fence changed while marking instance retryable");
             }
-            int capacityReleased = jdbc.update("""
-                    UPDATE sr_worker
-                    SET reserved_capacity = reserved_capacity - 1,
-                        updated_at = clock_timestamp()
-                    WHERE id = :workerId AND worker_epoch = :workerEpoch
-                      AND reserved_capacity > 0
-                    """, new MapSqlParameterSource()
-                    .addValue("workerId", workerId)
-                    .addValue("workerEpoch", workerEpoch));
-            if (capacityReleased != 1) {
+            if (!releaseWorkerCapacity(workerId, workerEpoch)) {
                 status.setRollbackOnly();
                 throw new IllegalStateException("worker capacity fence changed while marking attempt lost");
             }
@@ -422,16 +415,7 @@ public final class TaskAttemptRepository {
                 status.setRollbackOnly();
                 throw new IllegalStateException("attempt fence changed while completing instance");
             }
-            int capacityReleased = jdbc.update("""
-                    UPDATE sr_worker
-                    SET reserved_capacity = reserved_capacity - 1,
-                        updated_at = clock_timestamp()
-                    WHERE id = :workerId AND worker_epoch = :workerEpoch
-                      AND reserved_capacity > 0
-                    """, new MapSqlParameterSource()
-                    .addValue("workerId", workerId)
-                    .addValue("workerEpoch", workerEpoch));
-            if (capacityReleased != 1) {
+            if (!releaseWorkerCapacity(workerId, workerEpoch)) {
                 status.setRollbackOnly();
                 throw new IllegalStateException("worker capacity fence changed while completing attempt");
             }
@@ -503,6 +487,20 @@ public final class TaskAttemptRepository {
                 .addValue("leaseVersion", leaseVersion)
                 .addValue("workerId", workerId)
                 .addValue("workerEpoch", workerEpoch);
+    }
+
+    private boolean releaseWorkerCapacity(UUID workerId, UUID workerEpoch) {
+        return jdbc.update("""
+                UPDATE sr_worker
+                SET reserved_capacity = GREATEST(
+                        reported_active_count, reserved_capacity - 1),
+                    updated_at = clock_timestamp()
+                WHERE id = :workerId
+                  AND worker_epoch = :workerEpoch
+                  AND reserved_capacity > 0
+                """, new MapSqlParameterSource()
+                .addValue("workerId", workerId)
+                .addValue("workerEpoch", workerEpoch)) == 1;
     }
 
     private void requireTerminal(TaskAttemptStatus status) {

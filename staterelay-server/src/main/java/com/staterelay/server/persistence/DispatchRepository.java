@@ -6,6 +6,7 @@ import org.springframework.jdbc.core.namedparam.MapSqlParameterSource;
 import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate;
 import org.springframework.transaction.support.TransactionTemplate;
 
+import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.sql.Types;
@@ -122,9 +123,63 @@ public final class DispatchRepository {
             UUID taskAttemptId,
             UUID targetWorkerId,
             UUID targetWorkerEpoch) {
-        return transition(dispatchId, taskAttemptId, targetWorkerId, targetWorkerEpoch,
-                List.of(DispatchStatus.PENDING.name(), DispatchStatus.UNCERTAIN.name()),
-                DispatchStatus.SENT, null, null, true);
+        Instant now = Instant.now();
+        return markSending(dispatchId, taskAttemptId, targetWorkerId, targetWorkerEpoch,
+                now, now.plus(Duration.ofSeconds(5)));
+    }
+
+    /**
+     * Claims a due PENDING, UNCERTAIN, or expired SENT row for one bounded HTTP send lease.
+     * The compare-and-set is the single-sender fence shared by direct and scanner delivery.
+     */
+    public boolean markSending(
+            UUID dispatchId,
+            UUID taskAttemptId,
+            UUID targetWorkerId,
+            UUID targetWorkerEpoch,
+            Instant now,
+            Instant sendLeaseExpiresAt) {
+        Objects.requireNonNull(now, "now");
+        Objects.requireNonNull(sendLeaseExpiresAt, "sendLeaseExpiresAt");
+        if (!sendLeaseExpiresAt.isAfter(now)) {
+            throw new IllegalArgumentException("sendLeaseExpiresAt must be after now");
+        }
+        return Boolean.TRUE.equals(transactions.execute(status -> {
+            int updated = jdbc.update("""
+                    UPDATE sr_dispatch
+                    SET status = 'SENT',
+                        transport_attempts = transport_attempts + 1,
+                        next_transport_at = :sendLeaseExpiresAt,
+                        sent_at = clock_timestamp(), last_error = NULL,
+                        updated_at = clock_timestamp()
+                    WHERE dispatch_id = :dispatchId
+                      AND task_attempt_id = :attemptId
+                      AND target_worker_id = :workerId
+                      AND target_worker_epoch = :workerEpoch
+                      AND status IN ('PENDING', 'UNCERTAIN', 'SENT')
+                      AND next_transport_at <= :now
+                    """, new MapSqlParameterSource()
+                    .addValue("dispatchId", dispatchId)
+                    .addValue("attemptId", taskAttemptId)
+                    .addValue("workerId", targetWorkerId)
+                    .addValue("workerEpoch", targetWorkerEpoch)
+                    .addValue("now", now.atOffset(ZoneOffset.UTC), Types.TIMESTAMP_WITH_TIMEZONE)
+                    .addValue("sendLeaseExpiresAt",
+                            sendLeaseExpiresAt.atOffset(ZoneOffset.UTC),
+                            Types.TIMESTAMP_WITH_TIMEZONE));
+            if (updated == 0) {
+                return false;
+            }
+            outbox.append("DISPATCH", dispatchId, "DISPATCH_STATUS_CHANGED",
+                    JsonNodeFactory.instance.objectNode()
+                            .put("dispatchId", dispatchId.toString())
+                            .put("attemptId", taskAttemptId.toString())
+                            .put("workerId", targetWorkerId.toString())
+                            .put("workerEpoch", targetWorkerEpoch.toString())
+                            .put("status", DispatchStatus.SENT.name())
+                            .put("sendLeaseExpiresAt", sendLeaseExpiresAt.toString()));
+            return true;
+        }));
     }
 
     /** Schedules a stable-ID transport retry after an uncertain transmission result. */

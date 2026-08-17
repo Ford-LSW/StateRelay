@@ -59,6 +59,9 @@ public final class CapacityReservationService {
         }
         UUID workerId = UUID.fromString(selected.workerId());
         return Objects.requireNonNull(transactions.execute(status -> {
+            if (!lockClaimedInstance(claimed)) {
+                return Optional.empty();
+            }
             Optional<LockedAssignmentContext> locked = lockEligibleWorker(
                     claimed, workerId, handlerName);
             if (locked.isEmpty()) {
@@ -83,6 +86,21 @@ public final class CapacityReservationService {
                     context.application(), handlerName, context.parameter(),
                     context.idempotencyKey(), attemptLease, context.assignedAt()));
         }));
+    }
+
+    private boolean lockClaimedInstance(
+            TaskInstanceRepository.ClaimedTaskInstance claimed) {
+        return !jdbc.query("""
+                SELECT id
+                FROM sr_task_instance
+                WHERE id = :instanceId
+                  AND claim_token = :claimToken
+                  AND status IN ('READY', 'RETRY_WAIT')
+                FOR UPDATE
+                """, new MapSqlParameterSource()
+                .addValue("instanceId", claimed.instanceId())
+                .addValue("claimToken", claimed.claimToken()),
+                (resultSet, rowNumber) -> resultSet.getObject("id", UUID.class)).isEmpty();
     }
 
     private Optional<LockedAssignmentContext> lockEligibleWorker(

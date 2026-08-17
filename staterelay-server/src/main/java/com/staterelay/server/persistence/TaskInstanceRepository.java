@@ -11,6 +11,7 @@ import org.springframework.transaction.support.TransactionTemplate;
 
 import java.io.UncheckedIOException;
 import java.sql.Types;
+import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.List;
@@ -133,22 +134,39 @@ public final class TaskInstanceRepository {
      * selection; the token is the durable ownership proof after those locks are released.
      */
     public List<ClaimedTaskInstance> claimReadyBatch(Instant now, int batchSize) {
+        return claimReadyBatch(now, batchSize, Duration.ofSeconds(30));
+    }
+
+    /**
+     * Claims due rows, including claims whose owner has exceeded the bounded ownership timeout.
+     * Replacing the durable token fences every late release from the prior owner.
+     */
+    public List<ClaimedTaskInstance> claimReadyBatch(
+            Instant now, int batchSize, Duration claimTimeout) {
+        Objects.requireNonNull(now, "now");
         if (batchSize <= 0) {
             throw new IllegalArgumentException("batchSize must be positive");
         }
+        Objects.requireNonNull(claimTimeout, "claimTimeout");
+        if (claimTimeout.isZero() || claimTimeout.isNegative()) {
+            throw new IllegalArgumentException("claimTimeout must be positive");
+        }
         return Objects.requireNonNull(transactions.execute(status -> {
             UUID claimToken = UUID.randomUUID();
+            Instant expiredBefore = now.minus(claimTimeout);
             List<UUID> ids = jdbc.query("""
                     SELECT id
                     FROM sr_task_instance
                     WHERE status IN ('READY', 'RETRY_WAIT')
                       AND next_run_at <= :now
-                      AND claim_token IS NULL
+                      AND (claim_token IS NULL OR claimed_at <= :expiredBefore)
                     ORDER BY priority DESC, next_run_at, id
                     FOR UPDATE SKIP LOCKED
                     LIMIT :batchSize
                     """, new MapSqlParameterSource()
                     .addValue("now", now.atOffset(ZoneOffset.UTC), Types.TIMESTAMP_WITH_TIMEZONE)
+                    .addValue("expiredBefore", expiredBefore.atOffset(ZoneOffset.UTC),
+                            Types.TIMESTAMP_WITH_TIMEZONE)
                     .addValue("batchSize", batchSize),
                     (resultSet, rowNumber) -> resultSet.getObject("id", UUID.class));
             if (ids.isEmpty()) {
@@ -157,10 +175,13 @@ public final class TaskInstanceRepository {
             int updated = jdbc.update("""
                     UPDATE sr_task_instance
                     SET claim_token = :claimToken, claimed_at = :now, updated_at = clock_timestamp()
-                    WHERE id IN (:ids) AND claim_token IS NULL
+                    WHERE id IN (:ids)
+                      AND (claim_token IS NULL OR claimed_at <= :expiredBefore)
                     """, new MapSqlParameterSource()
                     .addValue("claimToken", claimToken)
                     .addValue("now", now.atOffset(ZoneOffset.UTC), Types.TIMESTAMP_WITH_TIMEZONE)
+                    .addValue("expiredBefore", expiredBefore.atOffset(ZoneOffset.UTC),
+                            Types.TIMESTAMP_WITH_TIMEZONE)
                     .addValue("ids", ids));
             if (updated != ids.size()) {
                 throw new IllegalStateException("claim update did not preserve selected ownership");
@@ -172,6 +193,38 @@ public final class TaskInstanceRepository {
                                 .put("claimToken", claimToken.toString()));
             }
             return ids.stream().map(id -> new ClaimedTaskInstance(id, claimToken)).toList();
+        }));
+    }
+
+    /**
+     * Defers only the claim still owned by the supplied durable token. A consumed or reclaimed
+     * claim is left untouched, so cleanup cannot undo a committed assignment.
+     */
+    public boolean deferClaim(ClaimedTaskInstance claimed, Instant nextRunAt) {
+        Objects.requireNonNull(claimed, "claimed");
+        Objects.requireNonNull(nextRunAt, "nextRunAt");
+        return Boolean.TRUE.equals(transactions.execute(status -> {
+            int updated = jdbc.update("""
+                    UPDATE sr_task_instance
+                    SET claim_token = NULL, claimed_at = NULL,
+                        next_run_at = :nextRunAt, updated_at = clock_timestamp()
+                    WHERE id = :instanceId
+                      AND claim_token = :claimToken
+                      AND status IN ('READY', 'RETRY_WAIT')
+                    """, new MapSqlParameterSource()
+                    .addValue("instanceId", claimed.instanceId())
+                    .addValue("claimToken", claimed.claimToken())
+                    .addValue("nextRunAt", nextRunAt.atOffset(ZoneOffset.UTC),
+                            Types.TIMESTAMP_WITH_TIMEZONE));
+            if (updated == 0) {
+                return false;
+            }
+            outbox.append("TASK_INSTANCE", claimed.instanceId(), "TASK_INSTANCE_CLAIM_DEFERRED",
+                    JsonNodeFactory.instance.objectNode()
+                            .put("taskInstanceId", claimed.instanceId().toString())
+                            .put("claimToken", claimed.claimToken().toString())
+                            .put("nextRunAt", nextRunAt.toString()));
+            return true;
         }));
     }
 

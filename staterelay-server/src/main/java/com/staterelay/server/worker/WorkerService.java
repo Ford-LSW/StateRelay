@@ -168,10 +168,42 @@ public final class WorkerService {
                     throw conflict("active execution lease is stale");
                 }
             }
+            List<UUID> lockedWorkers = jdbc.query("""
+                    SELECT id
+                    FROM sr_worker
+                    WHERE id = :workerId
+                      AND worker_epoch = :workerEpoch
+                      AND status <> 'OFFLINE'
+                    FOR UPDATE
+                    """, new MapSqlParameterSource()
+                    .addValue("workerId", workerId)
+                    .addValue("workerEpoch", request.workerEpoch()),
+                    (resultSet, rowNumber) -> resultSet.getObject("id", UUID.class));
+            if (lockedWorkers.isEmpty()) {
+                throw conflict("Worker identity is stale");
+            }
+            int unreleasedAttempts = jdbc.queryForObject("""
+                    SELECT count(*)::integer
+                    FROM sr_task_attempt
+                    WHERE worker_id = :workerId
+                      AND worker_epoch = :workerEpoch
+                      AND status IN (:activeStatuses)
+                      AND capacity_released_at IS NULL
+                    """, new MapSqlParameterSource()
+                    .addValue("workerId", workerId)
+                    .addValue("workerEpoch", request.workerEpoch())
+                    .addValue("activeStatuses", ACTIVE_ATTEMPT_STATUSES), Integer.class);
+            int knownReportedAttempts = Math.toIntExact(request.activeLeases().stream()
+                    .map(ExecutionLease::attemptId)
+                    .distinct()
+                    .count());
             int reported = jdbc.update("""
                     UPDATE sr_worker
                     SET status = CASE WHEN status = 'DRAINING' THEN 'DRAINING'
                                       ELSE :reportedStatus END,
+                        reserved_capacity = LEAST(:maxConcurrency,
+                            :unreleasedAttempts + GREATEST(
+                                0, :activeCount - :knownReportedAttempts)),
                         reported_active_count = :activeCount,
                         queue_depth = :queueDepth,
                         max_concurrency = :maxConcurrency,
@@ -185,6 +217,8 @@ public final class WorkerService {
                     """, new MapSqlParameterSource()
                     .addValue("reportedStatus", request.status())
                     .addValue("activeCount", request.activeCount())
+                    .addValue("unreleasedAttempts", unreleasedAttempts)
+                    .addValue("knownReportedAttempts", knownReportedAttempts)
                     .addValue("queueDepth", request.queueDepth())
                     .addValue("maxConcurrency", request.maxConcurrency())
                     .addValue("queueCapacity", request.queueCapacity())

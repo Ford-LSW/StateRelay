@@ -39,6 +39,7 @@ public final class DispatchService {
     private final ObjectMapper objectMapper;
     private final Duration attemptLease;
     private final Duration transportRetryDelay;
+    private final Duration sendLease;
 
     public DispatchService(
             CapacityReservationService capacityReservations,
@@ -49,6 +50,20 @@ public final class DispatchService {
             OutboxRepository outbox,
             Duration attemptLease,
             Duration transportRetryDelay) {
+        this(capacityReservations, router, executorHttpClient, jdbc, transactions, outbox,
+                attemptLease, transportRetryDelay, Duration.ofSeconds(5));
+    }
+
+    public DispatchService(
+            CapacityReservationService capacityReservations,
+            WorkerRouter router,
+            ExecutorHttpClient executorHttpClient,
+            NamedParameterJdbcTemplate jdbc,
+            TransactionTemplate transactions,
+            OutboxRepository outbox,
+            Duration attemptLease,
+            Duration transportRetryDelay,
+            Duration sendLease) {
         this.capacityReservations = Objects.requireNonNull(
                 capacityReservations, "capacityReservations");
         this.router = Objects.requireNonNull(router, "router");
@@ -61,6 +76,7 @@ public final class DispatchService {
         this.attempts = new TaskAttemptRepository(jdbc, transactions, outbox, objectMapper);
         this.attemptLease = requirePositive(attemptLease, "attemptLease");
         this.transportRetryDelay = requirePositive(transportRetryDelay, "transportRetryDelay");
+        this.sendLease = requirePositive(sendLease, "sendLease");
     }
 
     /** Routes a durably claimed instance and commits its complete logical assignment. */
@@ -94,11 +110,16 @@ public final class DispatchService {
 
     /** Performs one HTTP transmission after first committing the transport-attempt marker. */
     public void deliver(DispatchAssignment assignment) {
+        deliver(assignment, Instant.now());
+    }
+
+    private boolean deliver(DispatchAssignment assignment, Instant claimAt) {
         Objects.requireNonNull(assignment, "assignment");
         if (!dispatches.markSending(
                 assignment.dispatchId(), assignment.attemptId(),
-                assignment.workerId(), assignment.workerEpoch())) {
-            return;
+                assignment.workerId(), assignment.workerEpoch(),
+                claimAt, claimAt.plus(sendLease))) {
+            return false;
         }
         try {
             DispatchAck ack = executorHttpClient.execute(
@@ -110,9 +131,10 @@ public final class DispatchService {
         } catch (Exception exception) {
             markUncertain(assignment, exception.toString());
         }
+        return true;
     }
 
-    /** Retransmits due uncertain Dispatch rows while retaining every logical execution ID. */
+    /** Transmits due PENDING, UNCERTAIN, or expired-SENT rows with stable logical IDs. */
     public int retryUncertain(Instant now, int batchSize) {
         Objects.requireNonNull(now, "now");
         if (batchSize <= 0) {
@@ -133,7 +155,7 @@ public final class DispatchService {
                   ON version.id = instance.definition_version_id
                 JOIN sr_task_definition definition ON definition.id = instance.task_definition_id
                 JOIN sr_application application ON application.id = definition.application_id
-                WHERE dispatch.status = 'UNCERTAIN'
+                WHERE dispatch.status IN ('PENDING', 'UNCERTAIN', 'SENT')
                   AND dispatch.next_transport_at <= :now
                   AND attempt.status = 'ASSIGNED'
                 ORDER BY dispatch.next_transport_at, dispatch.id
@@ -161,8 +183,13 @@ public final class DispatchService {
                             resultSet.getString("idempotency_key"),
                             Duration.between(assignedAt, leaseExpiresAt), assignedAt);
                 });
-        due.forEach(this::deliver);
-        return due.size();
+        int transmitted = 0;
+        for (DispatchAssignment assignment : due) {
+            if (deliver(assignment, now)) {
+                transmitted++;
+            }
+        }
+        return transmitted;
     }
 
     private Optional<String> claimedHandler(

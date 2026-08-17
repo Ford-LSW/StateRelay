@@ -121,6 +121,48 @@ class WorkerRegistrationIntegrationTest extends PostgresRepositoryTestSupport {
     }
 
     @Test
+    void heartbeatPreservesUnknownReportedExecutionsThenConvergesAfterTheyExit() {
+        UUID applicationId = UUID.randomUUID();
+        jdbcTemplate.update("INSERT INTO sr_application(id, name) VALUES (?, ?)",
+                applicationId, "order-service");
+        UUID workerId = UUID.randomUUID();
+        UUID workerEpoch = UUID.randomUUID();
+        service.register(registration(workerId, workerEpoch));
+        insertActiveAttempt(applicationId, workerId, workerEpoch);
+        jdbcTemplate.update("""
+                UPDATE sr_worker
+                SET reserved_capacity = 16, reported_active_count = 15
+                WHERE id = ?
+                """, workerId);
+
+        service.heartbeat(workerId, new WorkerService.HeartbeatRequest(
+                "order-service", workerId, workerEpoch, "READY", 15, 0,
+                16, 64, Duration.ofSeconds(35), "0.2.0", Set.of(), List.of()));
+
+        assertThat(jdbcTemplate.queryForMap("""
+                SELECT reserved_capacity, reported_active_count,
+                    GREATEST(reserved_capacity, reported_active_count) AS effective_load
+                FROM sr_worker WHERE id = ?
+                """, workerId))
+                .containsEntry("reserved_capacity", 16)
+                .containsEntry("reported_active_count", 15)
+                .containsEntry("effective_load", 16);
+
+        service.heartbeat(workerId, new WorkerService.HeartbeatRequest(
+                "order-service", workerId, workerEpoch, "READY", 0, 0,
+                16, 64, Duration.ofSeconds(35), "0.2.0", Set.of(), List.of()));
+
+        assertThat(jdbcTemplate.queryForMap("""
+                SELECT reserved_capacity, reported_active_count,
+                    GREATEST(reserved_capacity, reported_active_count) AS effective_load
+                FROM sr_worker WHERE id = ?
+                """, workerId))
+                .containsEntry("reserved_capacity", 1)
+                .containsEntry("reported_active_count", 0)
+                .containsEntry("effective_load", 1);
+    }
+
+    @Test
     void oneStaleActiveLeaseRollsBackEveryRenewalAndWorkerReport() {
         UUID applicationId = UUID.randomUUID();
         jdbcTemplate.update("INSERT INTO sr_application(id, name) VALUES (?, ?)",
