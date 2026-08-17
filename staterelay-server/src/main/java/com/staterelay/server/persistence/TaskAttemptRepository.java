@@ -60,6 +60,23 @@ public final class TaskAttemptRepository {
             UUID workerId,
             UUID workerEpoch,
             Instant leaseExpiresAt) {
+        return createAttemptWithCapacityReservation(
+                taskInstanceId, claimToken, workerId, workerEpoch, null, null, leaseExpiresAt);
+    }
+
+    /**
+     * Creates an Attempt for a handler-compatible Worker while retaining the original durable
+     * claim and lease fences. The caller may wrap this method in a wider short transaction that
+     * also creates the logical Dispatch; Spring's required propagation keeps all writes atomic.
+     */
+    public Optional<AttemptLease> createAttemptWithCapacityReservation(
+            UUID taskInstanceId,
+            UUID claimToken,
+            UUID workerId,
+            UUID workerEpoch,
+            String handlerName,
+            Instant assignedAt,
+            Instant leaseExpiresAt) {
         Objects.requireNonNull(claimToken, "claimToken");
         return Objects.requireNonNull(transactions.execute(status -> {
             List<Long> leases = jdbc.query("""
@@ -86,9 +103,14 @@ public final class TaskAttemptRepository {
                       AND status = 'READY'
                       AND lease_expires_at > clock_timestamp()
                       AND GREATEST(reserved_capacity, reported_active_count) < max_concurrency
+                      AND (:handlerName IS NULL OR EXISTS (
+                          SELECT 1
+                          FROM jsonb_array_elements(handlers) handler
+                          WHERE handler ->> 'name' = :handlerName))
                     """, new MapSqlParameterSource()
                     .addValue("workerId", workerId)
-                    .addValue("workerEpoch", workerEpoch));
+                    .addValue("workerEpoch", workerEpoch)
+                    .addValue("handlerName", handlerName, Types.VARCHAR));
             if (reserved == 0) {
                 status.setRollbackOnly();
                 return Optional.empty();
@@ -105,7 +127,8 @@ public final class TaskAttemptRepository {
                         id, task_instance_id, attempt_no, lease_version, worker_id, worker_epoch,
                         status, lease_expires_at, assigned_at)
                     VALUES (:id, :instanceId, :attemptNo, :leaseVersion, :workerId, :workerEpoch,
-                        'ASSIGNED', :leaseExpiresAt, clock_timestamp())
+                        'ASSIGNED', :leaseExpiresAt,
+                        COALESCE(CAST(:assignedAt AS timestamptz), clock_timestamp()))
                     """, new MapSqlParameterSource()
                     .addValue("id", attemptId)
                     .addValue("instanceId", taskInstanceId)
@@ -113,6 +136,8 @@ public final class TaskAttemptRepository {
                     .addValue("leaseVersion", leaseVersion)
                     .addValue("workerId", workerId)
                     .addValue("workerEpoch", workerEpoch)
+                    .addValue("assignedAt", assignedAt == null ? null
+                            : assignedAt.atOffset(ZoneOffset.UTC), Types.TIMESTAMP_WITH_TIMEZONE)
                     .addValue("leaseExpiresAt", leaseExpiresAt.atOffset(ZoneOffset.UTC), Types.TIMESTAMP_WITH_TIMEZONE));
             outbox.append("TASK_ATTEMPT", attemptId, "TASK_ATTEMPT_CREATED",
                     JsonNodeFactory.instance.objectNode()
@@ -130,6 +155,45 @@ public final class TaskAttemptRepository {
                             .put("status", TaskInstanceStatus.RUNNING.name()));
             return Optional.of(new AttemptLease(
                     attemptId, taskInstanceId, attemptNumber, leaseVersion, workerId, workerEpoch));
+        }));
+    }
+
+    /** Marks only the exact assigned execution fence as accepted by its owning Worker epoch. */
+    public boolean markAttemptAccepted(
+            UUID taskInstanceId,
+            UUID attemptId,
+            long leaseVersion,
+            UUID workerId,
+            UUID workerEpoch) {
+        return Boolean.TRUE.equals(transactions.execute(status -> {
+            int updated = jdbc.update("""
+                    UPDATE sr_task_attempt attempt
+                    SET status = 'ACCEPTED', accepted_at = clock_timestamp(),
+                        updated_at = clock_timestamp()
+                    WHERE attempt.id = :attemptId
+                      AND attempt.task_instance_id = :instanceId
+                      AND attempt.lease_version = :leaseVersion
+                      AND attempt.worker_id = :workerId
+                      AND attempt.worker_epoch = :workerEpoch
+                      AND attempt.status = 'ASSIGNED'
+                      AND EXISTS (
+                          SELECT 1 FROM sr_task_instance instance
+                          WHERE instance.id = attempt.task_instance_id
+                            AND instance.current_lease_version = attempt.lease_version
+                            AND instance.status = 'RUNNING')
+                    """, fenceParameters(
+                    taskInstanceId, attemptId, leaseVersion, workerId, workerEpoch));
+            if (updated == 0) {
+                return false;
+            }
+            outbox.append("TASK_ATTEMPT", attemptId, "TASK_ATTEMPT_ACCEPTED",
+                    JsonNodeFactory.instance.objectNode()
+                            .put("taskInstanceId", taskInstanceId.toString())
+                            .put("attemptId", attemptId.toString())
+                            .put("leaseVersion", leaseVersion)
+                            .put("workerId", workerId.toString())
+                            .put("workerEpoch", workerEpoch.toString()));
+            return true;
         }));
     }
 

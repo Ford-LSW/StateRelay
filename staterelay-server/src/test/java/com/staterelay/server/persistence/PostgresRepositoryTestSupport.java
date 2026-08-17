@@ -48,8 +48,9 @@ public abstract class PostgresRepositoryTestSupport {
                 .addValue("name", "definition-" + definitionId));
         jdbc.update("""
                 INSERT INTO sr_task_definition_version(id, task_definition_id, version_no, status,
-                    configuration_snapshot, published_at)
-                VALUES (:id, :definitionId, 1, 'PUBLISHED', CAST(:configuration AS jsonb), :publishedAt)
+                    handler_name, configuration_snapshot, published_at)
+                VALUES (:id, :definitionId, 1, 'PUBLISHED', 'archiveOrders',
+                    CAST(:configuration AS jsonb), :publishedAt)
                 """, new MapSqlParameterSource()
                 .addValue("id", versionId)
                 .addValue("definitionId", definitionId)

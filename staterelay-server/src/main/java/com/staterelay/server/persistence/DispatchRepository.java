@@ -9,6 +9,7 @@ import org.springframework.transaction.support.TransactionTemplate;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.sql.Types;
+import java.util.List;
 import java.util.Objects;
 import java.util.UUID;
 
@@ -101,6 +102,102 @@ public final class DispatchRepository {
                     .addValue("expected", expected.name())
                     .addValue("next", next.name())
                     .addValue("lastError", lastError));
+            if (updated == 0) {
+                return false;
+            }
+            outbox.append("DISPATCH", dispatchId, "DISPATCH_STATUS_CHANGED",
+                    JsonNodeFactory.instance.objectNode()
+                            .put("dispatchId", dispatchId.toString())
+                            .put("attemptId", taskAttemptId.toString())
+                            .put("workerId", targetWorkerId.toString())
+                            .put("workerEpoch", targetWorkerEpoch.toString())
+                            .put("status", next.name()));
+            return true;
+        }));
+    }
+
+    /** Claims one pending or uncertain logical Dispatch for a single HTTP transmission. */
+    public boolean markSending(
+            UUID dispatchId,
+            UUID taskAttemptId,
+            UUID targetWorkerId,
+            UUID targetWorkerEpoch) {
+        return transition(dispatchId, taskAttemptId, targetWorkerId, targetWorkerEpoch,
+                List.of(DispatchStatus.PENDING.name(), DispatchStatus.UNCERTAIN.name()),
+                DispatchStatus.SENT, null, null, true);
+    }
+
+    /** Schedules a stable-ID transport retry after an uncertain transmission result. */
+    public boolean markUncertain(
+            UUID dispatchId,
+            UUID taskAttemptId,
+            UUID targetWorkerId,
+            UUID targetWorkerEpoch,
+            Instant nextTransportAt,
+            String lastError) {
+        return transition(dispatchId, taskAttemptId, targetWorkerId, targetWorkerEpoch,
+                List.of(DispatchStatus.SENT.name()), DispatchStatus.UNCERTAIN,
+                nextTransportAt, lastError, false);
+    }
+
+    /** Records proof that the Worker accepted this exact logical Dispatch. */
+    public boolean markAcked(
+            UUID dispatchId,
+            UUID taskAttemptId,
+            UUID targetWorkerId,
+            UUID targetWorkerEpoch) {
+        return transition(dispatchId, taskAttemptId, targetWorkerId, targetWorkerEpoch,
+                List.of(DispatchStatus.SENT.name()), DispatchStatus.ACKED, null, null, false);
+    }
+
+    /** Closes a Dispatch after the addressed Worker explicitly proves non-acceptance. */
+    public boolean markExpired(
+            UUID dispatchId,
+            UUID taskAttemptId,
+            UUID targetWorkerId,
+            UUID targetWorkerEpoch,
+            String reason) {
+        return transition(dispatchId, taskAttemptId, targetWorkerId, targetWorkerEpoch,
+                List.of(DispatchStatus.SENT.name()), DispatchStatus.EXPIRED, null, reason, false);
+    }
+
+    private boolean transition(
+            UUID dispatchId,
+            UUID taskAttemptId,
+            UUID targetWorkerId,
+            UUID targetWorkerEpoch,
+            List<String> expectedStatuses,
+            DispatchStatus next,
+            Instant nextTransportAt,
+            String lastError,
+            boolean transmission) {
+        return Boolean.TRUE.equals(transactions.execute(status -> {
+            int updated = jdbc.update("""
+                    UPDATE sr_dispatch
+                    SET status = :next,
+                        transport_attempts = transport_attempts + CASE WHEN :transmission THEN 1 ELSE 0 END,
+                        next_transport_at = :nextTransportAt,
+                        sent_at = CASE WHEN :transmission THEN clock_timestamp() ELSE sent_at END,
+                        acknowledged_at = CASE WHEN :next = 'ACKED' THEN clock_timestamp()
+                            ELSE acknowledged_at END,
+                        last_error = :lastError,
+                        updated_at = clock_timestamp()
+                    WHERE dispatch_id = :dispatchId
+                      AND task_attempt_id = :attemptId
+                      AND target_worker_id = :workerId
+                      AND target_worker_epoch = :workerEpoch
+                      AND status IN (:expectedStatuses)
+                    """, new MapSqlParameterSource()
+                    .addValue("dispatchId", dispatchId)
+                    .addValue("attemptId", taskAttemptId)
+                    .addValue("workerId", targetWorkerId)
+                    .addValue("workerEpoch", targetWorkerEpoch)
+                    .addValue("expectedStatuses", expectedStatuses)
+                    .addValue("next", next.name())
+                    .addValue("nextTransportAt", nextTransportAt == null ? null
+                            : nextTransportAt.atOffset(ZoneOffset.UTC), Types.TIMESTAMP_WITH_TIMEZONE)
+                    .addValue("lastError", lastError)
+                    .addValue("transmission", transmission));
             if (updated == 0) {
                 return false;
             }
