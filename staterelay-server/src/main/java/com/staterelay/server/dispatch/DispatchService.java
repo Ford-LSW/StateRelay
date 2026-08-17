@@ -115,21 +115,23 @@ public final class DispatchService {
 
     private boolean deliver(DispatchAssignment assignment, Instant claimAt) {
         Objects.requireNonNull(assignment, "assignment");
-        if (!dispatches.markSending(
+        Optional<DispatchRepository.SendLease> claimedSend = dispatches.claimSending(
                 assignment.dispatchId(), assignment.attemptId(),
                 assignment.workerId(), assignment.workerEpoch(),
-                claimAt, claimAt.plus(sendLease))) {
+                claimAt, claimAt.plus(sendLease));
+        if (claimedSend.isEmpty()) {
             return false;
         }
+        long transportGeneration = claimedSend.get().generation();
         try {
             DispatchAck ack = executorHttpClient.execute(
                     assignment.workerAddress(), assignment.command());
-            handleAck(assignment, ack);
+            handleAck(assignment, transportGeneration, ack);
         } catch (InterruptedException exception) {
             Thread.currentThread().interrupt();
-            markUncertain(assignment, "executor call interrupted");
+            markUncertain(assignment, transportGeneration, "executor call interrupted");
         } catch (Exception exception) {
-            markUncertain(assignment, exception.toString());
+            markUncertain(assignment, transportGeneration, exception.toString());
         }
         return true;
     }
@@ -282,15 +284,17 @@ public final class DispatchService {
                 workerId, workerEpoch, workerAddress, command);
     }
 
-    private void handleAck(DispatchAssignment assignment, DispatchAck ack) {
+    private void handleAck(
+            DispatchAssignment assignment, long transportGeneration, DispatchAck ack) {
         if (!matchesFence(assignment, ack) || ack.status() == null) {
-            markUncertain(assignment, "executor ACK did not match the dispatch fence");
+            markUncertain(assignment, transportGeneration,
+                    "executor ACK did not match the dispatch fence");
             return;
         }
         switch (ack.status()) {
-            case ACCEPTED, DUPLICATE -> markAccepted(assignment);
+            case ACCEPTED, DUPLICATE -> markAccepted(assignment, transportGeneration);
             case REJECTED_CAPACITY, REJECTED_HANDLER, REJECTED_STALE_EPOCH ->
-                    markRejected(assignment, ack);
+                    markRejected(assignment, transportGeneration, ack);
         }
     }
 
@@ -302,7 +306,7 @@ public final class DispatchService {
                 && Objects.equals(assignment.workerEpoch().toString(), ack.workerEpoch());
     }
 
-    private void markAccepted(DispatchAssignment assignment) {
+    private void markAccepted(DispatchAssignment assignment, long transportGeneration) {
         Boolean accepted = transactions.execute(status -> {
             boolean dispatchAcked = dispatches.markAcked(
                     assignment.dispatchId(), assignment.attemptId(),
@@ -317,15 +321,18 @@ public final class DispatchService {
             return true;
         });
         if (!Boolean.TRUE.equals(accepted)) {
-            markUncertain(assignment, "acceptance fence changed before persistence");
+            markUncertain(assignment, transportGeneration,
+                    "acceptance fence changed before persistence");
         }
     }
 
-    private void markRejected(DispatchAssignment assignment, DispatchAck ack) {
+    private void markRejected(
+            DispatchAssignment assignment, long transportGeneration, DispatchAck ack) {
         transactions.executeWithoutResult(status -> {
             boolean dispatchExpired = dispatches.markExpired(
                     assignment.dispatchId(), assignment.attemptId(),
-                    assignment.workerId(), assignment.workerEpoch(), ack.status().name());
+                    assignment.workerId(), assignment.workerEpoch(), transportGeneration,
+                    ack.status().name());
             boolean attemptLost = dispatchExpired && attempts.markAttemptLost(
                     assignment.taskInstanceId(), assignment.attemptId(), assignment.leaseVersion(),
                     assignment.workerId(), assignment.workerEpoch());
@@ -335,10 +342,11 @@ public final class DispatchService {
         });
     }
 
-    private void markUncertain(DispatchAssignment assignment, String error) {
+    private void markUncertain(
+            DispatchAssignment assignment, long transportGeneration, String error) {
         dispatches.markUncertain(
                 assignment.dispatchId(), assignment.attemptId(),
-                assignment.workerId(), assignment.workerEpoch(),
+                assignment.workerId(), assignment.workerEpoch(), transportGeneration,
                 Instant.now().plus(transportRetryDelay), error);
     }
 

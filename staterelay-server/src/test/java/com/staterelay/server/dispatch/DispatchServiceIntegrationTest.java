@@ -10,6 +10,7 @@ import com.staterelay.server.persistence.TaskInstanceRepository;
 import com.staterelay.server.persistence.TaskAttemptRepository;
 import com.staterelay.server.support.PostgresTestConfiguration;
 import com.staterelay.server.domain.TaskAttemptStatus;
+import com.staterelay.server.worker.WorkerService;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -20,6 +21,7 @@ import org.springframework.transaction.support.TransactionTemplate;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -147,9 +149,12 @@ class DispatchServiceIntegrationTest extends PostgresRepositoryTestSupport {
 
         service.deliver(assignment);
 
-        assertThat(jdbcTemplate.queryForObject(
-                "SELECT status FROM sr_dispatch WHERE dispatch_id = ?",
-                String.class, assignment.dispatchId())).isEqualTo("UNCERTAIN");
+        assertThat(jdbcTemplate.queryForMap("""
+                SELECT status, transport_generation
+                FROM sr_dispatch WHERE dispatch_id = ?
+                """, assignment.dispatchId()))
+                .containsEntry("status", "UNCERTAIN")
+                .containsEntry("transport_generation", 1L);
         assertThat(jdbcTemplate.queryForObject(
                 "SELECT status FROM sr_task_attempt WHERE id = ?",
                 String.class, assignment.attemptId())).isEqualTo("ASSIGNED");
@@ -167,9 +172,11 @@ class DispatchServiceIntegrationTest extends PostgresRepositoryTestSupport {
         DispatchService.DispatchAssignment assignment = service.assign(claim).orElseThrow();
         DispatchRepository dispatches = dispatches();
 
-        assertThat(dispatches.markSending(
+        Instant claimAt = databaseNow().plusSeconds(1);
+        assertThat(dispatches.claimSending(
                 assignment.dispatchId(), assignment.attemptId(),
-                assignment.workerId(), assignment.workerEpoch())).isTrue();
+                assignment.workerId(), assignment.workerEpoch(),
+                claimAt, claimAt.plusSeconds(5))).isPresent();
         int retried = service.retryUncertain(Instant.now().plusSeconds(10), 10);
 
         assertThat(retried).isOne();
@@ -199,15 +206,19 @@ class DispatchServiceIntegrationTest extends PostgresRepositoryTestSupport {
         DispatchRepository dispatches = dispatches();
         Instant dueAt = Instant.now().minusSeconds(1);
         DispatchService.DispatchAssignment uncertain = assignments.get(1);
-        assertThat(dispatches.markSending(
+        DispatchRepository.SendLease uncertainSend = dispatches.claimSending(
                 uncertain.dispatchId(), uncertain.attemptId(),
-                uncertain.workerId(), uncertain.workerEpoch())).isTrue();
+                uncertain.workerId(), uncertain.workerEpoch(),
+                databaseNow().plusSeconds(1), databaseNow().plusSeconds(6)).orElseThrow();
         assertThat(dispatches.markUncertain(
                 uncertain.dispatchId(), uncertain.attemptId(),
-                uncertain.workerId(), uncertain.workerEpoch(), dueAt, "lost ack")).isTrue();
+                uncertain.workerId(), uncertain.workerEpoch(), uncertainSend.generation(),
+                dueAt, "lost ack")).isTrue();
         DispatchService.DispatchAssignment sent = assignments.get(2);
-        assertThat(dispatches.markSending(
-                sent.dispatchId(), sent.attemptId(), sent.workerId(), sent.workerEpoch())).isTrue();
+        Instant sentAt = databaseNow().plusSeconds(1);
+        assertThat(dispatches.claimSending(
+                sent.dispatchId(), sent.attemptId(), sent.workerId(), sent.workerEpoch(),
+                sentAt, sentAt.plusSeconds(5))).isPresent();
         stubAck("ACCEPTED", fixture.workerId(), fixture.workerEpoch());
         Instant afterLease = Instant.now().plusSeconds(10);
 
@@ -230,6 +241,101 @@ class DispatchServiceIntegrationTest extends PostgresRepositoryTestSupport {
         assertThat(jdbcTemplate.queryForObject(
                 "SELECT count(*) FROM sr_dispatch WHERE status = 'ACKED'",
                 Integer.class)).isEqualTo(3);
+    }
+
+    @Test
+    void staleSendGenerationCannotOverwriteOrReleaseTheCurrentOwner() {
+        Fixture fixture = insertFixture(1, 0);
+        DispatchService.DispatchAssignment assignment = service().assign(
+                taskInstances().claimReadyBatch(databaseNow(), 1).get(0)).orElseThrow();
+        DispatchRepository dispatches = dispatches();
+        Instant firstClaimAt = databaseNow().plusSeconds(1);
+        DispatchRepository.SendLease first = dispatches.claimSending(
+                assignment.dispatchId(), assignment.attemptId(),
+                assignment.workerId(), assignment.workerEpoch(),
+                firstClaimAt, firstClaimAt.plusSeconds(1)).orElseThrow();
+        Instant secondClaimAt = first.expiresAt().plusMillis(1);
+        DispatchRepository.SendLease second = dispatches.claimSending(
+                assignment.dispatchId(), assignment.attemptId(),
+                assignment.workerId(), assignment.workerEpoch(),
+                secondClaimAt, secondClaimAt.plusSeconds(5)).orElseThrow();
+
+        assertThat(first.generation()).isEqualTo(1L);
+        assertThat(second.generation()).isEqualTo(2L);
+        assertThat(dispatches.markUncertain(
+                assignment.dispatchId(), assignment.attemptId(),
+                assignment.workerId(), assignment.workerEpoch(), first.generation(),
+                secondClaimAt.plusSeconds(1), "stale sender failed")).isFalse();
+        assertThat(dispatches.markExpired(
+                assignment.dispatchId(), assignment.attemptId(),
+                assignment.workerId(), assignment.workerEpoch(), first.generation(),
+                "stale explicit rejection")).isFalse();
+        assertThat(jdbcTemplate.queryForMap("""
+                SELECT status, transport_generation
+                FROM sr_dispatch WHERE dispatch_id = ?
+                """, assignment.dispatchId()))
+                .containsEntry("status", "SENT")
+                .containsEntry("transport_generation", 2L);
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT status FROM sr_task_attempt WHERE id = ?",
+                String.class, assignment.attemptId())).isEqualTo("ASSIGNED");
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT reserved_capacity FROM sr_worker WHERE id = ?",
+                Integer.class, fixture.workerId())).isOne();
+        assertThat(dispatches.claimSending(
+                assignment.dispatchId(), assignment.attemptId(),
+                assignment.workerId(), assignment.workerEpoch(),
+                second.expiresAt().minusMillis(1), second.expiresAt().plusSeconds(1))).isEmpty();
+
+        assertThat(dispatches.markExpired(
+                assignment.dispatchId(), assignment.attemptId(),
+                assignment.workerId(), assignment.workerEpoch(), second.generation(),
+                "current explicit rejection")).isTrue();
+        assertThat(attempts().markAttemptLost(
+                assignment.taskInstanceId(), assignment.attemptId(), assignment.leaseVersion(),
+                assignment.workerId(), assignment.workerEpoch())).isTrue();
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT reserved_capacity FROM sr_worker WHERE id = ?",
+                Integer.class, fixture.workerId())).isZero();
+    }
+
+    @Test
+    void acceptanceProofFromStaleGenerationWinsGloballyOverCurrentRejection() {
+        Fixture fixture = insertFixture(1, 0);
+        DispatchService.DispatchAssignment assignment = service().assign(
+                taskInstances().claimReadyBatch(databaseNow(), 1).get(0)).orElseThrow();
+        DispatchRepository dispatches = dispatches();
+        Instant firstClaimAt = databaseNow().plusSeconds(1);
+        DispatchRepository.SendLease first = dispatches.claimSending(
+                assignment.dispatchId(), assignment.attemptId(),
+                assignment.workerId(), assignment.workerEpoch(),
+                firstClaimAt, firstClaimAt.plusSeconds(1)).orElseThrow();
+        Instant secondClaimAt = first.expiresAt().plusMillis(1);
+        DispatchRepository.SendLease second = dispatches.claimSending(
+                assignment.dispatchId(), assignment.attemptId(),
+                assignment.workerId(), assignment.workerEpoch(),
+                secondClaimAt, secondClaimAt.plusSeconds(5)).orElseThrow();
+
+        assertThat(dispatches.markAcked(
+                assignment.dispatchId(), assignment.attemptId(),
+                assignment.workerId(), assignment.workerEpoch())).isTrue();
+        assertThat(attempts().markAttemptAccepted(
+                assignment.taskInstanceId(), assignment.attemptId(), assignment.leaseVersion(),
+                assignment.workerId(), assignment.workerEpoch())).isTrue();
+        assertThat(dispatches.markExpired(
+                assignment.dispatchId(), assignment.attemptId(),
+                assignment.workerId(), assignment.workerEpoch(), second.generation(),
+                "later rejection")).isFalse();
+
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT status FROM sr_dispatch WHERE dispatch_id = ?",
+                String.class, assignment.dispatchId())).isEqualTo("ACKED");
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT status FROM sr_task_attempt WHERE id = ?",
+                String.class, assignment.attemptId())).isEqualTo("ACCEPTED");
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT reserved_capacity FROM sr_worker WHERE id = ?",
+                Integer.class, fixture.workerId())).isOne();
     }
 
     @Test
@@ -357,6 +463,62 @@ class DispatchServiceIntegrationTest extends PostgresRepositoryTestSupport {
     }
 
     @Test
+    void completionOfReportedOverlapDoesNotExposeCapacityBeforeNextHeartbeat() {
+        OverlapFixture overlap = insertPartialOverlapFixture();
+        DispatchService service = service();
+        DispatchService.DispatchAssignment completed = overlap.assignments().get(0);
+        stubAck("ACCEPTED", overlap.fixture().workerId(), overlap.fixture().workerEpoch());
+        service.deliver(completed);
+        TaskAttemptRepository attempts = new TaskAttemptRepository(
+                jdbc, transactions, new OutboxRepository(jdbc, objectMapper), objectMapper);
+
+        assertThat(attempts.casCompleteAttempt(
+                completed.taskInstanceId(), completed.attemptId(), completed.leaseVersion(),
+                completed.workerId(), completed.workerEpoch(), TaskAttemptStatus.SUCCESS,
+                objectMapper.createObjectNode().put("completed", true))).isTrue();
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT reserved_capacity FROM sr_worker WHERE id = ?",
+                Integer.class, overlap.fixture().workerId())).isEqualTo(3);
+        TaskInstanceRepository.ClaimedTaskInstance waiting =
+                taskInstances().claimReadyBatch(databaseNow(), 1).get(0);
+        assertThat(service.assign(waiting)).isEmpty();
+
+        heartbeat(overlap.fixture(), 1, List.of());
+
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT reserved_capacity FROM sr_worker WHERE id = ?",
+                Integer.class, overlap.fixture().workerId())).isEqualTo(2);
+        assertThat(service.assign(waiting)).isPresent();
+    }
+
+    @Test
+    void rejectionOfReportedOverlapDoesNotExposeCapacityBeforeNextHeartbeat() {
+        OverlapFixture overlap = insertPartialOverlapFixture();
+        DispatchService service = service();
+        DispatchService.DispatchAssignment rejected = overlap.assignments().get(0);
+        stubAck("REJECTED_CAPACITY", overlap.fixture().workerId(), overlap.fixture().workerEpoch());
+
+        service.deliver(rejected);
+
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT status FROM sr_task_attempt WHERE id = ?",
+                String.class, rejected.attemptId())).isEqualTo("LOST");
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT reserved_capacity FROM sr_worker WHERE id = ?",
+                Integer.class, overlap.fixture().workerId())).isEqualTo(3);
+        TaskInstanceRepository.ClaimedTaskInstance waiting =
+                taskInstances().claimReadyBatch(databaseNow(), 1).get(0);
+        assertThat(service.assign(waiting)).isEmpty();
+
+        heartbeat(overlap.fixture(), 1, List.of());
+
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT reserved_capacity FROM sr_worker WHERE id = ?",
+                Integer.class, overlap.fixture().workerId())).isEqualTo(2);
+        assertThat(service.assign(waiting)).isPresent();
+    }
+
+    @Test
     void concurrentReservationsForOneFreeSlotCreateOnlyOneAttemptAndDispatch() throws Exception {
         Fixture fixture = insertFixture(16, 15);
         DispatchService service = service();
@@ -450,6 +612,42 @@ class DispatchServiceIntegrationTest extends PostgresRepositoryTestSupport {
     private DispatchRepository dispatches() {
         return new DispatchRepository(
                 jdbc, transactions, new OutboxRepository(jdbc, objectMapper));
+    }
+
+    private TaskAttemptRepository attempts() {
+        return new TaskAttemptRepository(
+                jdbc, transactions, new OutboxRepository(jdbc, objectMapper), objectMapper);
+    }
+
+    private OverlapFixture insertPartialOverlapFixture() {
+        Fixture fixture = insertFixture(3, 0);
+        insertReadyInstance(fixture.definitionId(), fixture.versionId());
+        insertReadyInstance(fixture.definitionId(), fixture.versionId());
+        List<DispatchService.DispatchAssignment> assignments =
+                taskInstances().claimReadyBatch(databaseNow(), 2).stream()
+                        .map(claim -> service().assign(claim).orElseThrow())
+                        .toList();
+        DispatchService.DispatchAssignment reportedOverlap = assignments.get(0);
+        heartbeat(fixture, 2, List.of(new WorkerService.ExecutionLease(
+                reportedOverlap.attemptId(), reportedOverlap.leaseVersion(),
+                fixture.workerEpoch())));
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT reserved_capacity FROM sr_worker WHERE id = ?",
+                Integer.class, fixture.workerId())).isEqualTo(3);
+        return new OverlapFixture(fixture, assignments);
+    }
+
+    private void heartbeat(
+            Fixture fixture, int activeCount, List<WorkerService.ExecutionLease> activeLeases) {
+        String application = jdbcTemplate.queryForObject(
+                "SELECT name FROM sr_application WHERE id = ?",
+                String.class, fixture.applicationId());
+        new WorkerService(jdbc, transactions, new OutboxRepository(jdbc, objectMapper), objectMapper)
+                .heartbeat(fixture.workerId(), new WorkerService.HeartbeatRequest(
+                        application, fixture.workerId(), fixture.workerEpoch(), "READY",
+                        activeCount, 0, 3, 0, null, "test",
+                        Set.of(new WorkerService.HandlerMetadata("archiveOrders", "test")),
+                        activeLeases));
     }
 
     private void awaitTask6InstanceLockWait() throws InterruptedException {
@@ -555,5 +753,9 @@ class DispatchServiceIntegrationTest extends PostgresRepositoryTestSupport {
             UUID instanceId,
             UUID workerId,
             UUID workerEpoch) {
+    }
+
+    private record OverlapFixture(
+            Fixture fixture, List<DispatchService.DispatchAssignment> assignments) {
     }
 }

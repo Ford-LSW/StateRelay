@@ -1,17 +1,16 @@
 package com.staterelay.server.persistence;
 
 import com.fasterxml.jackson.databind.node.JsonNodeFactory;
-import com.staterelay.server.domain.DispatchStatus;
 import org.springframework.jdbc.core.namedparam.MapSqlParameterSource;
 import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate;
 import org.springframework.transaction.support.TransactionTemplate;
 
-import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.sql.Types;
 import java.util.List;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.UUID;
 
 public final class DispatchRepository {
@@ -69,70 +68,10 @@ public final class DispatchRepository {
     }
 
     /**
-     * Advances the exact logical dispatch addressed to one Attempt and Worker epoch. Transport
-     * retries reuse the stable dispatch ID; this method never creates a replacement Attempt.
+     * Claims a due PENDING, UNCERTAIN, or expired SENT row and returns the only token allowed to
+     * write a non-acceptance transport result for that bounded HTTP send.
      */
-    public boolean casStatus(
-            UUID dispatchId,
-            UUID taskAttemptId,
-            UUID targetWorkerId,
-            UUID targetWorkerEpoch,
-            DispatchStatus expected,
-            DispatchStatus next,
-            String lastError) {
-        return Boolean.TRUE.equals(transactions.execute(status -> {
-            int updated = jdbc.update("""
-                    UPDATE sr_dispatch
-                    SET status = :next, last_error = :lastError,
-                        transport_attempts = transport_attempts + 1,
-                        sent_at = CASE WHEN :next IN ('SENT', 'UNCERTAIN', 'ACKED')
-                            THEN COALESCE(sent_at, clock_timestamp()) ELSE sent_at END,
-                        acknowledged_at = CASE WHEN :next = 'ACKED' THEN clock_timestamp()
-                            ELSE acknowledged_at END,
-                        updated_at = clock_timestamp()
-                    WHERE dispatch_id = :dispatchId
-                      AND task_attempt_id = :attemptId
-                      AND target_worker_id = :workerId
-                      AND target_worker_epoch = :workerEpoch
-                      AND status = :expected
-                    """, new MapSqlParameterSource()
-                    .addValue("dispatchId", dispatchId)
-                    .addValue("attemptId", taskAttemptId)
-                    .addValue("workerId", targetWorkerId)
-                    .addValue("workerEpoch", targetWorkerEpoch)
-                    .addValue("expected", expected.name())
-                    .addValue("next", next.name())
-                    .addValue("lastError", lastError));
-            if (updated == 0) {
-                return false;
-            }
-            outbox.append("DISPATCH", dispatchId, "DISPATCH_STATUS_CHANGED",
-                    JsonNodeFactory.instance.objectNode()
-                            .put("dispatchId", dispatchId.toString())
-                            .put("attemptId", taskAttemptId.toString())
-                            .put("workerId", targetWorkerId.toString())
-                            .put("workerEpoch", targetWorkerEpoch.toString())
-                            .put("status", next.name()));
-            return true;
-        }));
-    }
-
-    /** Claims one pending or uncertain logical Dispatch for a single HTTP transmission. */
-    public boolean markSending(
-            UUID dispatchId,
-            UUID taskAttemptId,
-            UUID targetWorkerId,
-            UUID targetWorkerEpoch) {
-        Instant now = Instant.now();
-        return markSending(dispatchId, taskAttemptId, targetWorkerId, targetWorkerEpoch,
-                now, now.plus(Duration.ofSeconds(5)));
-    }
-
-    /**
-     * Claims a due PENDING, UNCERTAIN, or expired SENT row for one bounded HTTP send lease.
-     * The compare-and-set is the single-sender fence shared by direct and scanner delivery.
-     */
-    public boolean markSending(
+    public Optional<SendLease> claimSending(
             UUID dispatchId,
             UUID taskAttemptId,
             UUID targetWorkerId,
@@ -144,11 +83,12 @@ public final class DispatchRepository {
         if (!sendLeaseExpiresAt.isAfter(now)) {
             throw new IllegalArgumentException("sendLeaseExpiresAt must be after now");
         }
-        return Boolean.TRUE.equals(transactions.execute(status -> {
-            int updated = jdbc.update("""
+        return Objects.requireNonNull(transactions.execute(status -> {
+            List<Long> claimed = jdbc.query("""
                     UPDATE sr_dispatch
                     SET status = 'SENT',
                         transport_attempts = transport_attempts + 1,
+                        transport_generation = transport_generation + 1,
                         next_transport_at = :sendLeaseExpiresAt,
                         sent_at = clock_timestamp(), last_error = NULL,
                         updated_at = clock_timestamp()
@@ -158,6 +98,7 @@ public final class DispatchRepository {
                       AND target_worker_epoch = :workerEpoch
                       AND status IN ('PENDING', 'UNCERTAIN', 'SENT')
                       AND next_transport_at <= :now
+                    RETURNING transport_generation
                     """, new MapSqlParameterSource()
                     .addValue("dispatchId", dispatchId)
                     .addValue("attemptId", taskAttemptId)
@@ -166,19 +107,22 @@ public final class DispatchRepository {
                     .addValue("now", now.atOffset(ZoneOffset.UTC), Types.TIMESTAMP_WITH_TIMEZONE)
                     .addValue("sendLeaseExpiresAt",
                             sendLeaseExpiresAt.atOffset(ZoneOffset.UTC),
-                            Types.TIMESTAMP_WITH_TIMEZONE));
-            if (updated == 0) {
-                return false;
+                            Types.TIMESTAMP_WITH_TIMEZONE),
+                    (resultSet, rowNumber) -> resultSet.getLong("transport_generation"));
+            if (claimed.isEmpty()) {
+                return Optional.empty();
             }
+            long generation = claimed.get(0);
             outbox.append("DISPATCH", dispatchId, "DISPATCH_STATUS_CHANGED",
                     JsonNodeFactory.instance.objectNode()
                             .put("dispatchId", dispatchId.toString())
                             .put("attemptId", taskAttemptId.toString())
                             .put("workerId", targetWorkerId.toString())
                             .put("workerEpoch", targetWorkerEpoch.toString())
-                            .put("status", DispatchStatus.SENT.name())
+                            .put("status", "SENT")
+                            .put("transportGeneration", generation)
                             .put("sendLeaseExpiresAt", sendLeaseExpiresAt.toString()));
-            return true;
+            return Optional.of(new SendLease(generation, sendLeaseExpiresAt));
         }));
     }
 
@@ -188,11 +132,11 @@ public final class DispatchRepository {
             UUID taskAttemptId,
             UUID targetWorkerId,
             UUID targetWorkerEpoch,
+            long transportGeneration,
             Instant nextTransportAt,
             String lastError) {
-        return transition(dispatchId, taskAttemptId, targetWorkerId, targetWorkerEpoch,
-                List.of(DispatchStatus.SENT.name()), DispatchStatus.UNCERTAIN,
-                nextTransportAt, lastError, false);
+        return transitionOwned(dispatchId, taskAttemptId, targetWorkerId, targetWorkerEpoch,
+                transportGeneration, "UNCERTAIN", nextTransportAt, lastError);
     }
 
     /** Records proof that the Worker accepted this exact logical Dispatch. */
@@ -201,8 +145,26 @@ public final class DispatchRepository {
             UUID taskAttemptId,
             UUID targetWorkerId,
             UUID targetWorkerEpoch) {
-        return transition(dispatchId, taskAttemptId, targetWorkerId, targetWorkerEpoch,
-                List.of(DispatchStatus.SENT.name()), DispatchStatus.ACKED, null, null, false);
+        return Boolean.TRUE.equals(transactions.execute(status -> {
+            int updated = jdbc.update("""
+                    UPDATE sr_dispatch
+                    SET status = 'ACKED', next_transport_at = NULL,
+                        acknowledged_at = clock_timestamp(), last_error = NULL,
+                        updated_at = clock_timestamp()
+                    WHERE dispatch_id = :dispatchId
+                      AND task_attempt_id = :attemptId
+                      AND target_worker_id = :workerId
+                      AND target_worker_epoch = :workerEpoch
+                      AND status = 'SENT'
+                    """, dispatchFence(
+                    dispatchId, taskAttemptId, targetWorkerId, targetWorkerEpoch));
+            if (updated == 0) {
+                return false;
+            }
+            appendStatusChanged(
+                    dispatchId, taskAttemptId, targetWorkerId, targetWorkerEpoch, "ACKED");
+            return true;
+        }));
     }
 
     /** Closes a Dispatch after the addressed Worker explicitly proves non-acceptance. */
@@ -211,59 +173,77 @@ public final class DispatchRepository {
             UUID taskAttemptId,
             UUID targetWorkerId,
             UUID targetWorkerEpoch,
+            long transportGeneration,
             String reason) {
-        return transition(dispatchId, taskAttemptId, targetWorkerId, targetWorkerEpoch,
-                List.of(DispatchStatus.SENT.name()), DispatchStatus.EXPIRED, null, reason, false);
+        return transitionOwned(dispatchId, taskAttemptId, targetWorkerId, targetWorkerEpoch,
+                transportGeneration, "EXPIRED", null, reason);
     }
 
-    private boolean transition(
+    private boolean transitionOwned(
             UUID dispatchId,
             UUID taskAttemptId,
             UUID targetWorkerId,
             UUID targetWorkerEpoch,
-            List<String> expectedStatuses,
-            DispatchStatus next,
+            long transportGeneration,
+            String next,
             Instant nextTransportAt,
-            String lastError,
-            boolean transmission) {
+            String lastError) {
         return Boolean.TRUE.equals(transactions.execute(status -> {
             int updated = jdbc.update("""
                     UPDATE sr_dispatch
                     SET status = :next,
-                        transport_attempts = transport_attempts + CASE WHEN :transmission THEN 1 ELSE 0 END,
                         next_transport_at = :nextTransportAt,
-                        sent_at = CASE WHEN :transmission THEN clock_timestamp() ELSE sent_at END,
-                        acknowledged_at = CASE WHEN :next = 'ACKED' THEN clock_timestamp()
-                            ELSE acknowledged_at END,
                         last_error = :lastError,
                         updated_at = clock_timestamp()
                     WHERE dispatch_id = :dispatchId
                       AND task_attempt_id = :attemptId
                       AND target_worker_id = :workerId
                       AND target_worker_epoch = :workerEpoch
-                      AND status IN (:expectedStatuses)
-                    """, new MapSqlParameterSource()
-                    .addValue("dispatchId", dispatchId)
-                    .addValue("attemptId", taskAttemptId)
-                    .addValue("workerId", targetWorkerId)
-                    .addValue("workerEpoch", targetWorkerEpoch)
-                    .addValue("expectedStatuses", expectedStatuses)
-                    .addValue("next", next.name())
+                      AND status = 'SENT'
+                      AND transport_generation = :transportGeneration
+                    """, dispatchFence(
+                            dispatchId, taskAttemptId, targetWorkerId, targetWorkerEpoch)
+                    .addValue("transportGeneration", transportGeneration)
+                    .addValue("next", next)
                     .addValue("nextTransportAt", nextTransportAt == null ? null
                             : nextTransportAt.atOffset(ZoneOffset.UTC), Types.TIMESTAMP_WITH_TIMEZONE)
-                    .addValue("lastError", lastError)
-                    .addValue("transmission", transmission));
+                    .addValue("lastError", lastError));
             if (updated == 0) {
                 return false;
             }
-            outbox.append("DISPATCH", dispatchId, "DISPATCH_STATUS_CHANGED",
-                    JsonNodeFactory.instance.objectNode()
-                            .put("dispatchId", dispatchId.toString())
-                            .put("attemptId", taskAttemptId.toString())
-                            .put("workerId", targetWorkerId.toString())
-                            .put("workerEpoch", targetWorkerEpoch.toString())
-                            .put("status", next.name()));
+            appendStatusChanged(
+                    dispatchId, taskAttemptId, targetWorkerId, targetWorkerEpoch, next);
             return true;
         }));
+    }
+
+    private MapSqlParameterSource dispatchFence(
+            UUID dispatchId,
+            UUID taskAttemptId,
+            UUID targetWorkerId,
+            UUID targetWorkerEpoch) {
+        return new MapSqlParameterSource()
+                .addValue("dispatchId", dispatchId)
+                .addValue("attemptId", taskAttemptId)
+                .addValue("workerId", targetWorkerId)
+                .addValue("workerEpoch", targetWorkerEpoch);
+    }
+
+    private void appendStatusChanged(
+            UUID dispatchId,
+            UUID taskAttemptId,
+            UUID targetWorkerId,
+            UUID targetWorkerEpoch,
+            String status) {
+        outbox.append("DISPATCH", dispatchId, "DISPATCH_STATUS_CHANGED",
+                JsonNodeFactory.instance.objectNode()
+                        .put("dispatchId", dispatchId.toString())
+                        .put("attemptId", taskAttemptId.toString())
+                        .put("workerId", targetWorkerId.toString())
+                        .put("workerEpoch", targetWorkerEpoch.toString())
+                        .put("status", status));
+    }
+
+    public record SendLease(long generation, Instant expiresAt) {
     }
 }

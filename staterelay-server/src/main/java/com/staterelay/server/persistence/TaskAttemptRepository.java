@@ -490,17 +490,40 @@ public final class TaskAttemptRepository {
     }
 
     private boolean releaseWorkerCapacity(UUID workerId, UUID workerEpoch) {
-        return jdbc.update("""
-                UPDATE sr_worker
-                SET reserved_capacity = GREATEST(
-                        reported_active_count, reserved_capacity - 1),
-                    updated_at = clock_timestamp()
-                WHERE id = :workerId
-                  AND worker_epoch = :workerEpoch
-                  AND reserved_capacity > 0
-                """, new MapSqlParameterSource()
+        MapSqlParameterSource fence = new MapSqlParameterSource()
                 .addValue("workerId", workerId)
-                .addValue("workerEpoch", workerEpoch)) == 1;
+                .addValue("workerEpoch", workerEpoch);
+        List<UUID> lockedWorkers = jdbc.query("""
+                SELECT id
+                FROM sr_worker
+                WHERE id = :workerId AND worker_epoch = :workerEpoch
+                FOR UPDATE
+                """, fence,
+                (resultSet, rowNumber) -> resultSet.getObject("id", UUID.class));
+        if (lockedWorkers.isEmpty()) {
+            return false;
+        }
+        return jdbc.update("""
+                UPDATE sr_worker worker
+                SET reserved_capacity = LEAST(worker.max_concurrency,
+                        (SELECT count(*)::integer
+                         FROM sr_task_attempt attempt
+                         WHERE attempt.worker_id = worker.id
+                           AND attempt.worker_epoch = worker.worker_epoch
+                           AND attempt.status IN ('ASSIGNED', 'ACCEPTED', 'RUNNING')
+                           AND attempt.capacity_released_at IS NULL)
+                        + GREATEST(0, worker.reported_active_count
+                            - (SELECT count(*)::integer
+                               FROM sr_task_attempt attempt
+                               WHERE attempt.worker_id = worker.id
+                                 AND attempt.worker_epoch = worker.worker_epoch
+                                 AND attempt.status IN ('ASSIGNED', 'ACCEPTED', 'RUNNING')
+                                 AND attempt.capacity_released_at IS NULL
+                                 AND attempt.id = ANY(worker.reported_active_attempt_ids)))),
+                    updated_at = clock_timestamp()
+                WHERE worker.id = :workerId
+                  AND worker.worker_epoch = :workerEpoch
+                """, fence) == 1;
     }
 
     private void requireTerminal(TaskAttemptStatus status) {

@@ -49,6 +49,8 @@ class WorkerRegistrationIntegrationTest extends PostgresRepositoryTestSupport {
         UUID oldEpoch = UUID.randomUUID();
         service.register(registration(oldWorkerId, oldEpoch));
         ActiveAttempt attempt = insertActiveAttempt(applicationId, oldWorkerId, oldEpoch);
+        service.heartbeat(oldWorkerId, heartbeat(oldWorkerId, oldEpoch, List.of(
+                new WorkerService.ExecutionLease(attempt.attemptId(), 7, oldEpoch))));
 
         UUID newWorkerId = UUID.randomUUID();
         UUID newEpoch = UUID.randomUUID();
@@ -64,6 +66,9 @@ class WorkerRegistrationIntegrationTest extends PostgresRepositoryTestSupport {
         assertThat(jdbcTemplate.queryForObject(
                 "SELECT reserved_capacity FROM sr_worker WHERE id = ?",
                 Integer.class, oldWorkerId)).isOne();
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT cardinality(reported_active_attempt_ids) FROM sr_worker WHERE id = ?",
+                Integer.class, oldWorkerId)).isZero();
 
         assertThatThrownBy(() -> service.heartbeat(oldWorkerId,
                 heartbeat(oldWorkerId, oldEpoch, List.of())))
@@ -118,6 +123,31 @@ class WorkerRegistrationIntegrationTest extends PostgresRepositoryTestSupport {
         assertThat(jdbcTemplate.queryForObject(
                 "SELECT handlers->0->>'name' FROM sr_worker WHERE id = ?",
                 String.class, workerId)).isEqualTo("archiveOrders");
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT reported_active_attempt_ids::text FROM sr_worker WHERE id = ?",
+                String.class, workerId)).isEqualTo("{" + attempt.attemptId() + "}");
+    }
+
+    @Test
+    void registrationOfTheSameEpochClearsThePreviousHeartbeatSnapshot() {
+        UUID applicationId = UUID.randomUUID();
+        jdbcTemplate.update("INSERT INTO sr_application(id, name) VALUES (?, ?)",
+                applicationId, "order-service");
+        UUID workerId = UUID.randomUUID();
+        UUID workerEpoch = UUID.randomUUID();
+        service.register(registration(workerId, workerEpoch));
+        ActiveAttempt attempt = insertActiveAttempt(applicationId, workerId, workerEpoch);
+        service.heartbeat(workerId, heartbeat(workerId, workerEpoch, List.of(
+                new WorkerService.ExecutionLease(attempt.attemptId(), 7, workerEpoch))));
+
+        service.register(registration(workerId, workerEpoch));
+
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT cardinality(reported_active_attempt_ids) FROM sr_worker WHERE id = ?",
+                Integer.class, workerId)).isZero();
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT reported_active_count FROM sr_worker WHERE id = ?",
+                Integer.class, workerId)).isZero();
     }
 
     @Test

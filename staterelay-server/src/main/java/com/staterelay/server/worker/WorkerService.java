@@ -100,7 +100,9 @@ public final class WorkerService {
                         executor_port = :executorPort, status = 'READY',
                         max_concurrency = :maxConcurrency,
                         queue_capacity = :queueCapacity, queue_depth = 0,
-                        reported_active_count = 0, handlers = CAST(:handlers AS jsonb),
+                        reported_active_count = 0,
+                        reported_active_attempt_ids = ARRAY[]::uuid[],
+                        handlers = CAST(:handlers AS jsonb),
                         starter_version = :starterVersion,
                         lease_expires_at = :leaseExpiresAt,
                         last_heartbeat_at = clock_timestamp(), updated_at = clock_timestamp()
@@ -193,10 +195,11 @@ public final class WorkerService {
                     .addValue("workerId", workerId)
                     .addValue("workerEpoch", request.workerEpoch())
                     .addValue("activeStatuses", ACTIVE_ATTEMPT_STATUSES), Integer.class);
-            int knownReportedAttempts = Math.toIntExact(request.activeLeases().stream()
+            List<UUID> reportedAttemptIds = request.activeLeases().stream()
                     .map(ExecutionLease::attemptId)
                     .distinct()
-                    .count());
+                    .toList();
+            int knownReportedAttempts = reportedAttemptIds.size();
             int reported = jdbc.update("""
                     UPDATE sr_worker
                     SET status = CASE WHEN status = 'DRAINING' THEN 'DRAINING'
@@ -205,6 +208,7 @@ public final class WorkerService {
                             :unreleasedAttempts + GREATEST(
                                 0, :activeCount - :knownReportedAttempts)),
                         reported_active_count = :activeCount,
+                        reported_active_attempt_ids = CAST(:reportedAttemptIds AS uuid[]),
                         queue_depth = :queueDepth,
                         max_concurrency = :maxConcurrency,
                         queue_capacity = :queueCapacity,
@@ -219,6 +223,7 @@ public final class WorkerService {
                     .addValue("activeCount", request.activeCount())
                     .addValue("unreleasedAttempts", unreleasedAttempts)
                     .addValue("knownReportedAttempts", knownReportedAttempts)
+                    .addValue("reportedAttemptIds", uuidArrayLiteral(reportedAttemptIds))
                     .addValue("queueDepth", request.queueDepth())
                     .addValue("maxConcurrency", request.maxConcurrency())
                     .addValue("queueCapacity", request.queueCapacity())
@@ -251,8 +256,10 @@ public final class WorkerService {
             UUID workerId, UUID workerEpoch, String targetStatus, String eventType) {
         Boolean changed = transactions.execute(status -> {
             int updated = jdbc.update("""
-                    UPDATE sr_worker
-                    SET status = :targetStatus,
+                UPDATE sr_worker
+                SET status = :targetStatus,
+                    reported_active_attempt_ids = CASE WHEN :targetStatus = 'OFFLINE'
+                        THEN ARRAY[]::uuid[] ELSE reported_active_attempt_ids END,
                         lease_expires_at = CASE WHEN :targetStatus = 'OFFLINE'
                             THEN clock_timestamp() ELSE lease_expires_at END,
                         updated_at = clock_timestamp()
@@ -290,6 +297,7 @@ public final class WorkerService {
         int offlined = jdbc.update("""
                 UPDATE sr_worker
                 SET status = 'OFFLINE', lease_expires_at = clock_timestamp(),
+                    reported_active_attempt_ids = ARRAY[]::uuid[],
                     updated_at = clock_timestamp()
                 WHERE id = :workerId AND worker_epoch = :workerEpoch
                   AND status <> 'OFFLINE'
@@ -381,6 +389,10 @@ public final class WorkerService {
         } catch (JsonProcessingException exception) {
             throw new UncheckedIOException(exception);
         }
+    }
+
+    private String uuidArrayLiteral(List<UUID> values) {
+        return "{" + String.join(",", values.stream().map(UUID::toString).toList()) + "}";
     }
 
     private void validateRegistration(RegistrationRequest request) {

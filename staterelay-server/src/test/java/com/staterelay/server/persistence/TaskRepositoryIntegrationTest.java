@@ -2,7 +2,6 @@ package com.staterelay.server.persistence;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.JsonNodeFactory;
-import com.staterelay.server.domain.DispatchStatus;
 import com.staterelay.server.domain.TaskAttemptStatus;
 import com.staterelay.server.domain.TaskInstanceStatus;
 import com.staterelay.server.support.PostgresTestConfiguration;
@@ -208,12 +207,13 @@ class TaskRepositoryIntegrationTest extends PostgresRepositoryTestSupport {
         UUID dispatchId = dispatchRepository.createDispatch(
                 attempt.attemptId(), worker.workerId(), worker.workerEpoch(), "http://worker:8080",
                 Instant.parse("2026-08-13T10:00:00Z"), Instant.parse("2026-08-13T10:05:00Z"));
-        boolean stale = dispatchRepository.casStatus(
+        Instant sendAt = Instant.parse("2026-08-13T10:00:01Z");
+        boolean stale = dispatchRepository.claimSending(
                 dispatchId, attempt.attemptId(), worker.workerId(), UUID.randomUUID(),
-                DispatchStatus.PENDING, DispatchStatus.SENT, null);
-        boolean sent = dispatchRepository.casStatus(
+                sendAt, sendAt.plusSeconds(5)).isPresent();
+        boolean sent = dispatchRepository.claimSending(
                 dispatchId, attempt.attemptId(), worker.workerId(), worker.workerEpoch(),
-                DispatchStatus.PENDING, DispatchStatus.SENT, null);
+                sendAt, sendAt.plusSeconds(5)).isPresent();
 
         assertThat(stale).isFalse();
         assertThat(sent).isTrue();
