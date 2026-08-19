@@ -3,9 +3,9 @@ package com.staterelay.server.dag.service;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.staterelay.contract.dag.ArtifactRef;
 import com.staterelay.server.dag.entity.DagArtifactEntity;
-import com.staterelay.server.dag.entity.DagNodeExecutionEntity;
+import com.staterelay.server.dag.entity.NodeInstanceEntity;
 import com.staterelay.server.dag.repository.DagArtifactRepository;
-import com.staterelay.server.dag.repository.DagNodeExecutionJpaRepository;
+import com.staterelay.server.dag.repository.NodeInstanceJpaRepository;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -20,14 +20,14 @@ import java.util.Map;
 public class DagArtifactService {
 
     private final DagArtifactRepository artifactRepository;
-    private final DagNodeExecutionJpaRepository nodeExecutionRepository;
+    private final NodeInstanceJpaRepository nodeInstanceRepository;
     private final ObjectMapper objectMapper;
 
     public DagArtifactService(DagArtifactRepository artifactRepository,
-                              DagNodeExecutionJpaRepository nodeExecutionRepository,
+                              NodeInstanceJpaRepository nodeInstanceRepository,
                               ObjectMapper objectMapper) {
         this.artifactRepository = artifactRepository;
-        this.nodeExecutionRepository = nodeExecutionRepository;
+        this.nodeInstanceRepository = nodeInstanceRepository;
         this.objectMapper = objectMapper;
     }
 
@@ -39,7 +39,7 @@ public class DagArtifactService {
         if (outputs == null || outputs.isEmpty()) {
             return;
         }
-        DagNodeExecutionEntity node = nodeExecutionRepository.findByDagInstanceIdAndNodeId(dagInstanceId, nodeId)
+        NodeInstanceEntity node = nodeInstanceRepository.findByDagInstanceIdAndNodeId(dagInstanceId, nodeId)
             .orElseThrow(() -> new IllegalStateException("Node not found: " + nodeId));
         Instant now = Instant.now();
         outputs.forEach((name, ref) -> {

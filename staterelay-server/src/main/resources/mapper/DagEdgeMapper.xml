@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.staterelay.server.dag.mapper.DagEdgeMapper">
+
+    <resultMap id="StringListMap" type="java.lang.String">
+        <result property="value" column="node_id"/>
+    </resultMap>
+
+    <!-- 检查指定节点的所有前置节点是否都 SUCCESS(50)。
+         status: 50=SUCCESS，未 SUCCESS 的前驱计入 unsatisfied -->
+    <select id="countUnsatisfiedPredecessors" resultType="int">
+        SELECT COUNT(*)
+        FROM sr_dag_edge ed
+        JOIN sr_dag_node_instance ni
+          ON ni.dag_instance_id = #{dagInstanceId}
+         AND ni.node_id = ed.from_node_id
+        WHERE ed.dag_definition_version_id = #{dagDefinitionVersionId}
+          AND ed.to_node_id = #{toNodeId}
+          AND ni.status != 50
+    </select>
+
+    <!-- 查询指定节点的所有直接后继 nodeId -->
+    <select id="findSuccessorNodeIds" resultType="java.lang.String">
+        SELECT DISTINCT to_node_id AS node_id
+        FROM sr_dag_edge
+        WHERE dag_definition_version_id = #{dagDefinitionVersionId}
+          AND from_node_id = #{fromNodeId}
+    </select>
+
+    <!-- 查询指定节点的所有直接前驱 nodeId -->
+    <select id="findPredecessorNodeIds" resultType="java.lang.String">
+        SELECT DISTINCT from_node_id AS node_id
+        FROM sr_dag_edge
+        WHERE dag_definition_version_id = #{dagDefinitionVersionId}
+          AND to_node_id = #{toNodeId}
+    </select>
+
+    <!-- 查询入度为 0 的节点（无前驱节点） -->
+    <select id="findRootNodeIds" resultType="java.lang.String">
+        SELECT n.node_id
+        FROM (
+            SELECT node_id
+            FROM sr_dag_definition_version dv, JSONB_ARRAY_ELEMENTS(dv.definition_snapshot -> 'nodes') AS n(node_id)
+            WHERE dv.id = #{dagDefinitionVersionId}
+        ) n
+        LEFT JOIN sr_dag_edge e
+          ON e.dag_definition_version_id = #{dagDefinitionVersionId}
+         AND e.to_node_id = n.node_id ->> 'id'
+        WHERE e.id IS NULL
+    </select>
+
+    <!-- 批量插入边。#{e.edgeType.code} 取 DagEdgeType 的数值编码 -->
+    <insert id="batchInsertEdges">
+        INSERT INTO sr_dag_edge
+            (dag_definition_version_id, from_node_id, to_node_id, edge_type, condition_expr, created_at)
+        VALUES
+        <foreach collection="edges" item="e" separator=",">
+            (#{dagDefinitionVersionId}, #{e.from}, #{e.to}, #{e.edgeType.code}, #{e.condition}, NOW())
+        </foreach>
+    </insert>
+
+</mapper>

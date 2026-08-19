@@ -7,7 +7,6 @@ import com.staterelay.contract.dag.ArtifactRef;
 import com.staterelay.contract.dag.DagDefinition;
 import com.staterelay.server.dag.entity.DagArtifactEntity;
 import com.staterelay.server.dag.entity.DagInstanceEntity;
-import com.staterelay.server.dag.entity.DagNodeExecutionEntity;
 import com.staterelay.server.dag.mapper.DagEdgeMapper;
 import com.staterelay.server.dag.service.DagArtifactService;
 import com.staterelay.server.dag.service.DagDefinitionService;

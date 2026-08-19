@@ -1,0 +1,87 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.staterelay.server.dag.mapper.DagInstanceMapper">
+
+    <resultMap id="DagInstanceLeaseMap" type="com.staterelay.server.dag.mapper.dto.DagInstanceLease">
+        <id     property="id"                  column="id"/>
+        <result property="workerId"            column="worker_id"/>
+        <result property="leaseVersion"        column="lease_version"/>
+        <result property="leaseExpireTime"     column="lease_expire_time"/>
+    </resultMap>
+
+    <!-- 扫描 INIT 实例（NodeInstance 创建完后 CAS 到 RUNNING）
+         status: 0=INIT -->
+    <select id="scanInitInstances" resultMap="DagInstanceLeaseMap">
+        SELECT id, worker_id, lease_version, lease_expire_time
+        FROM sr_dag_instance
+        WHERE status = 0
+          AND next_schedule_time &lt;= #{now}
+        ORDER BY next_schedule_time, id
+        LIMIT #{batchSize}
+        FOR UPDATE SKIP LOCKED
+    </select>
+
+    <!-- CAS: INIT(0) → RUNNING(10)，NodeInstance 全部创建完后调用 -->
+    <update id="tryStartInstance">
+        UPDATE sr_dag_instance
+        SET status = 10,
+            started_at = #{now},
+            last_progress_time = #{now},
+            updated_at = #{now}
+        WHERE id = #{dagInstanceId}
+          AND status = 0
+    </update>
+
+    <!-- 扫描 RUNNING 实例（DAG Engine 轮询推进）
+         status: 10=RUNNING -->
+    <select id="scanRunningInstances" resultMap="DagInstanceLeaseMap">
+        SELECT id, worker_id, lease_version, lease_expire_time
+        FROM sr_dag_instance
+        WHERE status = 10
+          AND (lease_expire_time IS NULL OR lease_expire_time &gt; #{now})
+        ORDER BY last_progress_time, id
+        LIMIT #{batchSize}
+        FOR UPDATE SKIP LOCKED
+    </select>
+
+    <!-- 终态化: CAS RUNNING(10) → SUCCESS(20)/FAILED(30)/CANCELLED(40) -->
+    <update id="finalizeInstance">
+        UPDATE sr_dag_instance
+        SET status = #{status.code},
+            success_node_count = #{successCount},
+            failed_node_count = #{failedCount},
+            skipped_node_count = #{skippedCount},
+            finished_at = #{now},
+            error_code = #{errorCode},
+            error_message = #{errorMessage},
+            updated_at = #{now}
+        WHERE id = #{dagInstanceId}
+          AND status = 10
+    </update>
+
+    <!-- 取消 DAG 实例：CAS → CANCELLED(40), lease_version+1
+         status: 0=INIT, 10=RUNNING -->
+    <update id="cancelInstance">
+        UPDATE sr_dag_instance
+        SET status = 40,
+            lease_version = lease_version + 1,
+            next_schedule_time = #{now},
+            updated_at = #{now}
+        WHERE id = #{dagInstanceId}
+          AND status IN (0, 10)
+    </update>
+
+    <!-- 更新心跳与租约 -->
+    <update id="updateLease">
+        UPDATE sr_dag_instance
+        SET heartbeat_time = #{now},
+            lease_expire_time = #{leaseExpireTime},
+            last_progress_time = #{now},
+            updated_at = #{now}
+        WHERE id = #{dagInstanceId}
+          AND worker_id = #{workerId}
+          AND lease_version = #{leaseVersion}
+    </update>
+
+</mapper>

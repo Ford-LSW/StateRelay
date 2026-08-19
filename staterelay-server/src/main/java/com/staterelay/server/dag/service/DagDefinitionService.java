@@ -30,23 +30,26 @@ import java.util.Optional;
 public class DagDefinitionService {
 
     private static final DagDefinitionVersionStatus VERSION_STATUS_DRAFT = DagDefinitionVersionStatus.DRAFT;
-    private static final DagDefinitionVersionStatus VERSION_STATUS_PUBLISHED = DagDefinitionVersionStatus.PUBLISHED;
+    private static final DagDefinitionVersionStatus VERSION_STATUS_ENABLED = DagDefinitionVersionStatus.ENABLED;
 
     private final DagDefinitionRepository definitionRepository;
     private final DagDefinitionVersionRepository versionRepository;
     private final DagEdgeRepository edgeRepository;
     private final DagEdgeMapper edgeMapper;
+    private final DagDefinitionValidator validator;
     private final ObjectMapper objectMapper;
 
     public DagDefinitionService(DagDefinitionRepository definitionRepository,
                                 DagDefinitionVersionRepository versionRepository,
                                 DagEdgeRepository edgeRepository,
                                 DagEdgeMapper edgeMapper,
+                                DagDefinitionValidator validator,
                                 ObjectMapper objectMapper) {
         this.definitionRepository = definitionRepository;
         this.versionRepository = versionRepository;
         this.edgeRepository = edgeRepository;
         this.edgeMapper = edgeMapper;
+        this.validator = validator;
         this.objectMapper = objectMapper;
     }
 
@@ -98,7 +101,7 @@ public class DagDefinitionService {
     }
 
     /**
-     * 发布草稿版本。
+     * 发布草稿版本（对齐文档 §3.2：发布时强制做拓扑校验，不通过则状态保持 DRAFT）。
      */
     @Transactional
     public DagDefinitionVersionEntity publish(Long versionId) {
@@ -107,7 +110,9 @@ public class DagDefinitionService {
         if (!VERSION_STATUS_DRAFT.equals(version.getStatus())) {
             throw new IllegalStateException("Only DRAFT version can be published");
         }
-        version.setStatus(VERSION_STATUS_PUBLISHED);
+        // 发布前强制拓扑校验，失败抛 IllegalArgumentException，状态保持 DRAFT
+        validator.validate(loadSnapshot(version));
+        version.setStatus(VERSION_STATUS_ENABLED);
         version.setPublishedAt(Instant.now());
         version.setUpdatedAt(Instant.now());
         return versionRepository.save(version);
@@ -125,7 +130,7 @@ public class DagDefinitionService {
      */
     public Optional<DagDefinitionVersionEntity> findLatestPublished(Long dagDefinitionId) {
         return versionRepository.findTopByDagDefinitionIdAndStatusOrderByVersionNoDesc(
-            dagDefinitionId, VERSION_STATUS_PUBLISHED);
+            dagDefinitionId, VERSION_STATUS_ENABLED);
     }
 
     /**

@@ -1,15 +1,14 @@
 package com.staterelay.server.dag.orchestration;
 
+import com.staterelay.contract.dag.DagDefinition;
 import com.staterelay.contract.dag.enums.DagInstanceStatus;
-import com.staterelay.contract.dag.enums.DagNodeExecutionStatus;
+import com.staterelay.contract.dag.enums.NodeInstanceStatus;
 import com.staterelay.server.dag.entity.DagInstanceEntity;
-import com.staterelay.server.dag.entity.DagNodeExecutionEntity;
-import com.staterelay.server.dag.mapper.DagEdgeMapper;
+import com.staterelay.server.dag.entity.NodeInstanceEntity;
 import com.staterelay.server.dag.mapper.DagInstanceMapper;
-import com.staterelay.server.dag.mapper.DagNodeExecutionMapper;
-import com.staterelay.server.dag.mapper.dto.DagInstanceLease;
+import com.staterelay.server.dag.mapper.NodeInstanceMapper;
 import com.staterelay.server.dag.repository.DagInstanceRepository;
-import com.staterelay.server.dag.repository.DagNodeExecutionJpaRepository;
+import com.staterelay.server.dag.repository.NodeInstanceJpaRepository;
 import com.staterelay.server.dag.service.DagDefinitionService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -20,16 +19,18 @@ import java.time.Instant;
 import java.util.List;
 
 /**
- * DAG Orchestrator 核心 Service，负责一个 DAG 实例在本轮的推进逻辑。
+ * DAG Engine 核心 Service（对齐文档 §19.2 轮询模型）。
  *
- * <p>推进流程：
+ * <p>每轮推进职责：
  * <ol>
- *   <li>加载实例和节点</li>
- *   <li>对每个未完成节点：判断前置是否满足，满足则 WAITING→READY（冻结 binding）→ READY→QUEUED（关联 task）</li>
- *   <li>所有节点终态化后，终态化 DAG 实例</li>
+ *   <li>处理取消中的实例（NodeInstance 链式 CANCELLED → DagInstance CANCELLED）</li>
+ *   <li>同步 Attempt 终态到 NodeInstance（§19.1 事务）</li>
+ *   <li>推进后继节点 WAITING → READY（含根节点首轮推进）</li>
+ *   <li>链式跳过：FAILED 节点的后继 → SKIPPED（§20.2）</li>
+ *   <li>终态化 DagInstance（§22）</li>
  * </ol>
  *
- * <p>实际任务分发由 {@code DispatchScanner}（现有项目）负责，本类只负责 DAG 层的节点推进和唤醒。
+ * <p>所有推进均使用 CAS，幂等：CAS 失败说明已被其他 Engine 实例处理，跳过即可。
  */
 @Service
 public class DagOrchestratorService {
@@ -37,147 +38,166 @@ public class DagOrchestratorService {
     private static final Logger log = LoggerFactory.getLogger(DagOrchestratorService.class);
 
     private final DagInstanceRepository instanceRepository;
-    private final DagNodeExecutionJpaRepository nodeExecutionRepository;
+    private final NodeInstanceJpaRepository nodeInstanceRepository;
     private final DagInstanceMapper instanceMapper;
-    private final DagNodeExecutionMapper nodeExecutionMapper;
-    private final DagEdgeMapper edgeMapper;
+    private final NodeInstanceMapper nodeInstanceMapper;
     private final DagDefinitionService definitionService;
     private final BindingResolver bindingResolver;
 
     public DagOrchestratorService(DagInstanceRepository instanceRepository,
-                                   DagNodeExecutionJpaRepository nodeExecutionRepository,
+                                   NodeInstanceJpaRepository nodeInstanceRepository,
                                    DagInstanceMapper instanceMapper,
-                                   DagNodeExecutionMapper nodeExecutionMapper,
-                                   DagEdgeMapper edgeMapper,
+                                   NodeInstanceMapper nodeInstanceMapper,
                                    DagDefinitionService definitionService,
                                    BindingResolver bindingResolver) {
         this.instanceRepository = instanceRepository;
-        this.nodeExecutionRepository = nodeExecutionRepository;
+        this.nodeInstanceRepository = nodeInstanceRepository;
         this.instanceMapper = instanceMapper;
-        this.nodeExecutionMapper = nodeExecutionMapper;
-        this.edgeMapper = edgeMapper;
+        this.nodeInstanceMapper = nodeInstanceMapper;
         this.definitionService = definitionService;
         this.bindingResolver = bindingResolver;
     }
 
     /**
-     * CAS: READY → QUEUED (version+1)，抢占推进权。
-     */
-    @Transactional
-    public boolean tryEnqueueForAdvance(DagInstanceLease lease, Instant now, Instant deadline) {
-        int updated = instanceMapper.tryEnqueueForAdvance(
-            lease.getId(), lease.getWorkerId(), lease.getLeaseVersion(), now, deadline);
-        return updated > 0;
-    }
-
-    public Long getCurrentOrchestrationVersion(Long dagInstanceId) {
-        return instanceMapper.getCurrentOrchestrationVersion(dagInstanceId);
-    }
-
-    /**
-     * CAS: QUEUED → EXECUTING（Runnable 启动时校验版本）。
-     */
-    @Transactional
-    public boolean tryEnterExecuting(DagInstanceLease lease, Long expectedVersion, Instant now) {
-        int updated = instanceMapper.tryEnterExecuting(
-            lease.getId(), expectedVersion, lease.getWorkerId(), lease.getLeaseVersion(), now);
-        return updated > 0;
-    }
-
-    /**
-     * CAS: EXECUTING → WAITING_NODES (version+1)，本轮推进结束。
-     */
-    @Transactional
-    public int tryEnterWaitingNodes(Long dagInstanceId) {
-        return instanceMapper.tryEnterWaitingNodes(dagInstanceId, Instant.now());
-    }
-
-    /**
-     * 推进一个 DAG 实例的节点。
+     * 推进一个 RUNNING 的 DAG 实例（对齐文档 §19.2 轮询模型）。
      *
-     * <p>幂等：节点 CAS 失败说明已被其他 Orchestrator 处理，跳过即可。
+     * <p>scanner 仅扫 RUNNING 实例；CANCELLED 实例的节点取消在 cancel API 同事务内完成。
      */
     @Transactional
     public void advanceInstance(Long dagInstanceId) {
         DagInstanceEntity instance = instanceRepository.findById(dagInstanceId)
             .orElseThrow(() -> new IllegalStateException("DAG instance not found: " + dagInstanceId));
-        if ("CANCELLING".equals(instance.getStatus())) {
-            handleCancelling(instance);
-            return;
-        }
-        if (!"RUNNING".equals(instance.getStatus())) {
-            return;
-        }
 
-        // 加载定义版本快照（用于查询边和节点定义）
+        if (instance.getStatus() != DagInstanceStatus.RUNNING) {
+            return;  // scanner 仅领取 RUNNING，理论上不会进入其他分支
+        }
+        advanceRunning(instance);
+    }
+
+    private void advanceRunning(DagInstanceEntity instance) {
+        Instant now = Instant.now();
+
+        // NodeAttempt 终态 → NodeInstance 推进由 NodeAttemptSyncService 独立 @Scheduled 完成（§19.1 + §19.2 轮询）
+
+        // 1. 推进后继节点 WAITING → READY（含根节点首轮推进，§5.1 + §20）
+        advanceReadyableNodes(instance, now);
+
+        // 2. 链式跳过 FAILED 节点的后继（§20.2）
+        skipDescendantsOfFailed(instance, now);
+
+        // 3. 终态化 DagInstance（§22）
+        tryFinalizeInstance(instance, now);
+    }
+
+    /**
+     * 推进所有满足条件的 WAITING 节点到 READY（根节点 + 前驱全部 SUCCESS 的后继节点）。
+     */
+    private void advanceReadyableNodes(DagInstanceEntity instance, Instant now) {
+        List<Long> readyable = nodeInstanceMapper.findReadyableNodes(instance.getId());
+        if (readyable.isEmpty()) {
+            return;
+        }
         BindingResolver.DagDefinitionVersionLite versionLite = loadVersionLite(instance);
         if (versionLite == null) {
-            log.warn("DAG definition version not found for instance {}", dagInstanceId);
+            log.warn("DAG definition version not found for instance {}", instance.getId());
             return;
         }
-
-        List<DagNodeExecutionEntity> nodes = nodeExecutionRepository.findByDagInstanceId(dagInstanceId);
-        Instant now = Instant.now();
-        for (DagNodeExecutionEntity node : nodes) {
-            tryAdvanceNode(instance, versionLite, node, now);
-        }
-        tryFinalizeInstance(instance);
-    }
-
-    private void handleCancelling(DagInstanceEntity instance) {
-        Instant now = Instant.now();
-        nodeExecutionMapper.cancelUnstartedNodes(instance.getId(), now);
-        nodeExecutionMapper.cancelRunningNodes(instance.getId(), now);
-        instanceMapper.finalizeInstance(instance.getId(), DagInstanceStatus.CANCELLED, 0, 0, 0, null, null, now);
-    }
-
-    private void tryAdvanceNode(DagInstanceEntity instance,
-                                BindingResolver.DagDefinitionVersionLite versionLite,
-                                DagNodeExecutionEntity node,
-                                Instant now) {
-        if (node.getStatus() != DagNodeExecutionStatus.PENDING
-                && node.getStatus() != DagNodeExecutionStatus.WAITING) {
-            return;
-        }
-        if (node.getStatus() == DagNodeExecutionStatus.PENDING) {
-            if (nodeExecutionMapper.markWaiting(node.getId(), now) == 0) {
-                return;
+        for (Long nodeInstanceId : readyable) {
+            NodeInstanceEntity node = nodeInstanceRepository.findById(nodeInstanceId).orElse(null);
+            if (node == null || node.getStatus() != NodeInstanceStatus.WAITING) {
+                continue;  // CAS 失败 / 已被其他实例推进
+            }
+            DagDefinition.DagNode dagNode = findDagNode(versionLite, node.getNodeId());
+            if (dagNode == null) {
+                log.warn("Node {} not found in DAG definition snapshot for instance {}",
+                    node.getNodeId(), instance.getId());
+                continue;
+            }
+            String bindings = bindingResolver.resolveBindings(instance, versionLite, dagNode);
+            int updated = nodeInstanceMapper.markReady(nodeInstanceId, bindings, now);
+            if (updated > 0) {
+                log.debug("Node {} of DAG instance {} advanced WAITING → READY",
+                    node.getNodeId(), instance.getId());
             }
         }
-        // 检查前置
-        int unsatisfied = edgeMapper.countUnsatisfiedPredecessors(
-            instance.getId(), versionLite.getVersionId(), node.getNodeId());
-        if (unsatisfied > 0) {
-            return;
-        }
-        // WAITING → READY，冻结 binding
-        var dagNode = findDagNode(versionLite, node.getNodeId());
-        if (dagNode == null) {
-            log.warn("Node {} not found in DAG definition snapshot for instance {}",
-                node.getNodeId(), instance.getId());
-            return;
-        }
-        String bindings = bindingResolver.resolveBindings(instance, versionLite, dagNode);
-        if (nodeExecutionMapper.markReady(node.getId(), bindings, now) == 0) {
-            return;
-        }
-        // 实际 task_instance_id 由 DispatchScanner 在领取节点后回写（markQueued）
-        log.debug("Node {} of DAG instance {} advanced to READY", node.getNodeId(), instance.getId());
     }
 
-    private void tryFinalizeInstance(DagInstanceEntity instance) {
-        List<DagNodeExecutionEntity> nodes = nodeExecutionRepository.findByDagInstanceId(instance.getId());
-        int success = 0, failed = 0, skipped = 0;
-        for (DagNodeExecutionEntity node : nodes) {
-            switch (node.getStatus()) {
-                case SUCCESS -> success++;
-                case FAILED -> failed++;
-                case SKIPPED, CANCELLED -> skipped++;
-                default -> { /* still in progress */ return; }
+    /**
+     * 链式跳过 FAILED 节点的后继（§20.2）。
+     *
+     * <p>规则：若某 WAITING 节点的所有前驱均为 FAILED/SKIPPED（无可成功路径），则 CAS → SKIPPED。
+     * 通过 {@link NodeInstanceMapper#findReadyableNodes} 反向查询"无法推进且存在前驱的 WAITING 节点"，
+     * 简化实现：扫描 WAITING 节点中前驱全部为终态失败（FAILED/SKIPPED）的节点。
+     *
+     * <p>根节点（无前驱）天然不会被跳过，因为 {@code hasAnyPred=false} 直接返回 false。
+     */
+    private void skipDescendantsOfFailed(DagInstanceEntity instance, Instant now) {
+        List<NodeInstanceEntity> waitingNodes = nodeInstanceRepository
+            .findByDagInstanceIdAndStatusIn(instance.getId(), List.of(NodeInstanceStatus.WAITING));
+        if (waitingNodes.isEmpty()) {
+            return;
+        }
+        BindingResolver.DagDefinitionVersionLite versionLite = loadVersionLite(instance);
+        if (versionLite == null || versionLite.getSnapshot().getEdges() == null) {
+            return;
+        }
+        List<NodeInstanceEntity> all = nodeInstanceRepository.findByDagInstanceId(instance.getId());
+        for (NodeInstanceEntity node : waitingNodes) {
+            if (allPredecessorsFailed(versionLite, all, node.getNodeId())) {
+                int updated = nodeInstanceMapper.markSkipped(node.getId(), now);
+                if (updated > 0) {
+                    log.debug("Node {} of DAG instance {} skipped (predecessors all failed)",
+                        node.getNodeId(), instance.getId());
+                }
             }
         }
-        DagInstanceStatus finalStatus = failed > 0 ? DagInstanceStatus.FAILED : DagInstanceStatus.SUCCESS;
-        instanceMapper.finalizeInstance(instance.getId(), finalStatus, success, failed, skipped, null, null, Instant.now());
+    }
+
+    /**
+     * 判断指定节点的所有前驱是否均为 FAILED/SKIPPED。
+     * 根节点（无前驱）返回 false（不跳过）。
+     */
+    private boolean allPredecessorsFailed(BindingResolver.DagDefinitionVersionLite versionLite,
+                                          List<NodeInstanceEntity> allNodes,
+                                          String nodeId) {
+        boolean hasAnyPred = false;
+        for (DagDefinition.DagEdge edge : versionLite.getSnapshot().getEdges()) {
+            if (!nodeId.equals(edge.getTo())) {
+                continue;
+            }
+            hasAnyPred = true;
+            for (NodeInstanceEntity pred : allNodes) {
+                if (pred.getNodeId().equals(edge.getFrom())) {
+                    if (pred.getStatus() != NodeInstanceStatus.FAILED
+                            && pred.getStatus() != NodeInstanceStatus.SKIPPED) {
+                        // 前驱非失败，不能跳过
+                        return false;
+                    }
+                }
+            }
+        }
+        return hasAnyPred;
+    }
+
+    /**
+     * 终态化 DagInstance（§22）。
+     */
+    private void tryFinalizeInstance(DagInstanceEntity instance, Instant now) {
+        NodeInstanceMapper.NodeStatusCount count = nodeInstanceMapper.countByStatus(instance.getId());
+        if (count == null || count.getActiveCount() == null || count.getActiveCount() > 0) {
+            return;  // 仍有非终态节点
+        }
+        DagInstanceStatus finalStatus = count.getFailedCount() > 0
+            ? DagInstanceStatus.FAILED : DagInstanceStatus.SUCCESS;
+        int updated = instanceMapper.finalizeInstance(
+            instance.getId(), finalStatus,
+            count.getSuccessCount() == null ? 0 : count.getSuccessCount(),
+            count.getFailedCount() == null ? 0 : count.getFailedCount(),
+            count.getSkippedCount() == null ? 0 : count.getSkippedCount(),
+            null, null, now);
+        if (updated > 0) {
+            log.info("DAG instance {} finalized as {}", instance.getId(), finalStatus);
+        }
     }
 
     private BindingResolver.DagDefinitionVersionLite loadVersionLite(DagInstanceEntity instance) {
@@ -186,7 +206,7 @@ public class DagOrchestratorService {
             .orElse(null);
     }
 
-    private com.staterelay.contract.dag.DagDefinition.DagNode findDagNode(
+    private DagDefinition.DagNode findDagNode(
         BindingResolver.DagDefinitionVersionLite versionLite, String nodeId) {
         return versionLite.getSnapshot().getNodes().stream()
             .filter(n -> nodeId.equals(n.getId()))

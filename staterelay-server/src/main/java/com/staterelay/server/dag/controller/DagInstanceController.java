@@ -2,8 +2,9 @@ package com.staterelay.server.dag.controller;
 
 import com.staterelay.contract.dag.StartDagInstanceRequest;
 import com.staterelay.server.dag.entity.DagInstanceEntity;
-import com.staterelay.server.dag.entity.DagNodeExecutionEntity;
+import com.staterelay.server.dag.entity.NodeInstanceEntity;
 import com.staterelay.server.dag.service.DagInstanceService;
+import org.springframework.validation.annotation.Validated;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -19,6 +20,7 @@ import java.util.List;
  */
 @RestController
 @RequestMapping("/api/v1/dag/instances")
+@Validated
 public class DagInstanceController {
 
     private final DagInstanceService instanceService;
@@ -40,7 +42,7 @@ public class DagInstanceController {
     }
 
     @GetMapping("/{instanceId}/nodes")
-    public List<DagNodeExecutionEntity> listNodes(@PathVariable Long instanceId) {
+    public List<NodeInstanceEntity> listNodes(@PathVariable Long instanceId) {
         return instanceService.listNodes(instanceId);
     }
 

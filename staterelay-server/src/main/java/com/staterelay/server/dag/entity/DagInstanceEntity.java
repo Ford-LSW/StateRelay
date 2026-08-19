@@ -1,8 +1,6 @@
 package com.staterelay.server.dag.entity;
 
-import com.staterelay.contract.dag.enums.DagInstanceOrchestrationState;
 import com.staterelay.contract.dag.enums.DagInstanceStatus;
-import com.staterelay.server.dag.converter.DagInstanceOrchestrationStateConverter;
 import com.staterelay.server.dag.converter.DagInstanceStatusConverter;
 import jakarta.persistence.Column;
 import jakarta.persistence.Convert;
@@ -18,7 +16,10 @@ import java.time.Instant;
 /**
  * DAG 实例（{@code sr_dag_instance}）。
  *
- * <p>简单查询（按 id、按 idempotency_key）走 JPA；租约抢占、CAS 推进走 MyBatis Mapper。
+ * <p>状态机对齐文档：INIT → RUNNING → SUCCESS/FAILED/CANCELLED。
+ * 去掉了 orchestration_state 子状态机，由 status 唯一驱动。
+ *
+ * <p>简单查询走 JPA；租约抢占、CAS 推进走 MyBatis Mapper。
  */
 @Data
 @Entity
@@ -52,7 +53,7 @@ public class DagInstanceEntity {
 
     @Column(name = "status", nullable = false)
     @Convert(converter = DagInstanceStatusConverter.class)
-    private DagInstanceStatus status = DagInstanceStatus.PENDING;
+    private DagInstanceStatus status = DagInstanceStatus.INIT;
 
     @Column(name = "worker_id", length = 160)
     private String workerId;
@@ -68,19 +69,6 @@ public class DagInstanceEntity {
 
     @Column(name = "last_progress_time")
     private Instant lastProgressTime;
-
-    @Column(name = "orchestration_state", nullable = false)
-    @Convert(converter = DagInstanceOrchestrationStateConverter.class)
-    private DagInstanceOrchestrationState orchestrationState = DagInstanceOrchestrationState.READY;
-
-    @Column(name = "orchestration_version", nullable = false)
-    private Long orchestrationVersion = 0L;
-
-    @Column(name = "orchestration_deadline")
-    private Instant orchestrationDeadline;
-
-    @Column(name = "orchestration_updated_at")
-    private Instant orchestrationUpdatedAt;
 
     @Column(name = "total_node_count", nullable = false)
     private Integer totalNodeCount = 0;
@@ -115,4 +103,3 @@ public class DagInstanceEntity {
     @Column(name = "updated_at", nullable = false)
     private Instant updatedAt;
 }
-

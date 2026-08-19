@@ -1,0 +1,131 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.staterelay.server.dag.mapper.NodeAttemptMapper">
+
+    <!-- 插入新的 NodeAttempt 记录
+         status: 0=CREATED -->
+    <insert id="insert">
+        INSERT INTO sr_dag_node_attempt
+            (dag_instance_id, node_instance_id, attempt_no, request_id,
+             algorithm_code, worker_id, worker_address, status, request_json,
+             created_at, updated_at)
+        VALUES
+            (#{attempt.dagInstanceId}, #{attempt.nodeInstanceId}, #{attempt.attemptNo}, #{attempt.requestId},
+             #{attempt.algorithmCode}, #{attempt.workerId}, #{attempt.workerAddress}, 0, CAST(#{attempt.requestJson} AS JSONB),
+             #{now}, #{now})
+    </insert>
+
+    <!-- CAS: CREATED(0) → DISPATCHING(10) -->
+    <update id="markDispatching">
+        UPDATE sr_dag_node_attempt
+        SET status = 10,
+            dispatched_at = #{now},
+            version = version + 1,
+            updated_at = #{now}
+        WHERE id = #{attemptId}
+          AND status = 0
+    </update>
+
+    <!-- CAS: DISPATCHING(10) → ACCEPTED(20) -->
+    <update id="markAccepted">
+        UPDATE sr_dag_node_attempt
+        SET status = 20,
+            accepted_at = #{now},
+            version = version + 1,
+            updated_at = #{now}
+        WHERE id = #{attemptId}
+          AND status = 10
+    </update>
+
+    <!-- CAS: ACCEPTED(20) → RUNNING(30) -->
+    <update id="markRunning">
+        UPDATE sr_dag_node_attempt
+        SET status = 30,
+            started_at = #{now},
+            version = version + 1,
+            updated_at = #{now}
+        WHERE id = #{attemptId}
+          AND status = 20
+    </update>
+
+    <!-- CAS: RUNNING(30) → SUCCESS(40) -->
+    <update id="markSuccess">
+        UPDATE sr_dag_node_attempt
+        SET status = 40,
+            result_json = CAST(#{resultJson} AS JSONB),
+            result_ref = #{resultRef},
+            finished_at = #{now},
+            version = version + 1,
+            updated_at = #{now}
+        WHERE id = #{attemptId}
+          AND status = 30
+    </update>
+
+    <!-- CAS: RUNNING(30) → FAILED(50) -->
+    <update id="markFailed">
+        UPDATE sr_dag_node_attempt
+        SET status = 50,
+            error_code = #{errorCode},
+            error_message = #{errorMessage},
+            finished_at = #{now},
+            version = version + 1,
+            updated_at = #{now}
+        WHERE id = #{attemptId}
+          AND status = 30
+    </update>
+
+    <!-- CAS: RUNNING(30) → TIMEOUT(70) -->
+    <update id="markTimeout">
+        UPDATE sr_dag_node_attempt
+        SET status = 70,
+            finished_at = #{now},
+            version = version + 1,
+            updated_at = #{now}
+        WHERE id = #{attemptId}
+          AND status = 30
+    </update>
+
+    <!-- CAS: → UNKNOWN(80) -->
+    <update id="markUnknown">
+        UPDATE sr_dag_node_attempt
+        SET status = 80,
+            finished_at = #{now},
+            version = version + 1,
+            updated_at = #{now}
+        WHERE id = #{attemptId}
+          AND status IN (10, 20, 30)
+    </update>
+
+    <!-- 扫描 RUNNING(30) 且超时的 Attempt
+         超时条件：now - started_at > a.timeout_seconds（通过 JOIN algorithm_definition 获取超时配置） -->
+    <select id="scanTimeoutAttempts" resultType="java.lang.Long">
+        SELECT a.id
+        FROM sr_dag_node_attempt a
+        WHERE a.status = 30
+          AND a.started_at IS NOT NULL
+          AND (NOW() - a.started_at) > (
+              SELECT COALESCE(alg.timeout_seconds, 300)
+              FROM sr_algorithm_definition alg
+              WHERE alg.algorithm_code = a.algorithm_code
+          )
+        ORDER BY a.started_at, a.id
+        LIMIT #{batchSize}
+        FOR UPDATE SKIP LOCKED
+    </select>
+
+    <!-- 扫描终态但未处理的 Attempt（DAG Engine 推进 NodeInstance）
+         终态：40=SUCCESS, 50=FAILED, 70=TIMEOUT, 80=UNKNOWN
+         未处理：对应的 NodeInstance 仍是 RUNNING(40) -->
+    <select id="scanTerminalAttempts" resultType="java.lang.Long">
+        SELECT a.id
+        FROM sr_dag_node_attempt a
+        JOIN sr_dag_node_instance ni ON ni.id = a.node_instance_id
+        WHERE a.status IN (40, 50, 70, 80)
+          AND ni.status = 40
+        ORDER BY a.finished_at, a.id
+        LIMIT #{batchSize}
+        FOR UPDATE SKIP LOCKED
+    </select>
+
+</mapper>

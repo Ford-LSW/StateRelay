@@ -1,0 +1,156 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.staterelay.server.dag.mapper.DagNodeExecutionMapper">
+
+    <resultMap id="NodeCompletionSnapshotMap" type="com.staterelay.server.dag.mapper.dto.NodeCompletionSnapshot">
+        <id     property="nodeExecutionId"     column="id"/>
+        <result property="dagInstanceId"      column="dag_instance_id"/>
+        <result property="nodeId"             column="node_id"/>
+        <result property="handlerName"        column="handler_name_snapshot"/>
+        <result property="taskInstanceId"     column="task_instance_id"/>
+        <result property="finishedAt"          column="finished_at"/>
+    </resultMap>
+
+    <!-- 批量插入节点执行实例（DAG 实例启动时）
+         status=0=PENDING, orchestration_state=0=PENDING -->
+    <insert id="batchInsert">
+        INSERT INTO sr_dag_node_execution
+            (dag_instance_id, node_id, node_name_snapshot, handler_name_snapshot,
+             status, orchestration_state, created_at, updated_at)
+        VALUES
+        <foreach collection="nodes" item="n" separator=",">
+            (#{dagInstanceId}, #{n.nodeId}, #{n.nodeName}, #{n.handlerName},
+             0, 0, #{now}, #{now})
+        </foreach>
+    </insert>
+
+    <!-- PENDING(0) → WAITING(1)，CAS -->
+    <update id="markWaiting">
+        UPDATE sr_dag_node_execution
+        SET status = 1,
+            orchestration_updated_at = #{now},
+            updated_at = #{now}
+        WHERE id = #{nodeExecutionId}
+          AND status = 0
+    </update>
+
+    <!-- WAITING(1) → READY(2)，冻结 binding 快照；orch_state: 0=PENDING → 1=READY -->
+    <update id="markReady">
+        UPDATE sr_dag_node_execution
+        SET status = 2,
+            orchestration_state = 1,
+            input_bindings_snapshot = CAST(#{bindings} AS JSONB),
+            started_at = COALESCE(started_at, #{now}),
+            orchestration_updated_at = #{now},
+            updated_at = #{now}
+        WHERE id = #{nodeExecutionId}
+          AND status = 1
+    </update>
+
+    <!-- READY(2) → orch_state: 1=READY → 2=QUEUED，关联 task_instance_id，CAS: task_instance_id IS NULL -->
+    <update id="markQueued">
+        UPDATE sr_dag_node_execution
+        SET orchestration_state = 2,
+            task_instance_id = #{taskInstanceId},
+            orchestration_updated_at = #{now},
+            updated_at = #{now}
+        WHERE id = #{nodeExecutionId}
+          AND status = 2
+          AND orchestration_state = 1
+          AND task_instance_id IS NULL
+    </update>
+
+    <!-- READY(2) → RUNNING(3), orch_state: 2=QUEUED → 3=EXECUTING -->
+    <update id="markRunning">
+        UPDATE sr_dag_node_execution
+        SET status = 3,
+            orchestration_state = 3,
+            started_at = COALESCE(started_at, #{now}),
+            orchestration_updated_at = #{now},
+            updated_at = #{now}
+        WHERE id = #{nodeExecutionId}
+          AND status = 2
+          AND orchestration_state = 2
+    </update>
+
+    <!-- orch_state: 3=EXECUTING → 4=WAITING_RESULT -->
+    <update id="markWaitingResult">
+        UPDATE sr_dag_node_execution
+        SET orchestration_state = 4,
+            orchestration_updated_at = #{now},
+            updated_at = #{now}
+        WHERE id = #{nodeExecutionId}
+          AND orchestration_state = 3
+    </update>
+
+    <!-- orch_state: 4=WAITING_RESULT → 5=DONE, status: 3=RUNNING → 4=SUCCESS，返回快照 -->
+    <select id="markSuccess" resultMap="NodeCompletionSnapshotMap">
+        UPDATE sr_dag_node_execution
+        SET status = 4,
+            orchestration_state = 5,
+            orchestration_version = orchestration_version + 1,
+            finished_at = #{now},
+            orchestration_updated_at = #{now},
+            updated_at = #{now}
+        WHERE id = #{nodeExecutionId}
+          AND status = 3
+          AND orchestration_state = 4
+        RETURNING id, dag_instance_id, node_id, handler_name_snapshot, task_instance_id, finished_at
+    </select>
+
+    <!-- orch_state: 4=WAITING_RESULT → 5=DONE, status: 3=RUNNING → 5=FAILED -->
+    <update id="markFailed">
+        UPDATE sr_dag_node_execution
+        SET status = 5,
+            orchestration_state = 5,
+            orchestration_version = orchestration_version + 1,
+            error_code = #{errorCode},
+            error_message = #{errorMessage},
+            finished_at = #{now},
+            orchestration_updated_at = #{now},
+            updated_at = #{now}
+        WHERE id = #{nodeExecutionId}
+          AND status = 3
+          AND orchestration_state = 4
+    </update>
+
+    <!-- 取消未启动节点（status: 0=PENDING, 1=WAITING, 2=READY → 8=CANCELLED） -->
+    <update id="cancelUnstartedNodes">
+        UPDATE sr_dag_node_execution
+        SET status = 8,
+            orchestration_state = 5,
+            finished_at = #{now},
+            updated_at = #{now}
+        WHERE dag_instance_id = #{dagInstanceId}
+          AND status IN (0, 1, 2)
+    </update>
+
+    <!-- 取消运行中节点（status: 3=RUNNING → 7=CANCELLING） -->
+    <update id="cancelRunningNodes">
+        UPDATE sr_dag_node_execution
+        SET status = 7,
+            orchestration_state = 5,
+            orchestration_version = orchestration_version + 1,
+            updated_at = #{now}
+        WHERE dag_instance_id = #{dagInstanceId}
+          AND status = 3
+    </update>
+
+    <!-- 节点重试：status 5=FAILED → 2=READY, orch_state 5=DONE → 1=READY，刷新 binding 快照 -->
+    <update id="retryNode">
+        UPDATE sr_dag_node_execution
+        SET status = 2,
+            orchestration_state = 1,
+            orchestration_version = orchestration_version + 1,
+            input_bindings_snapshot = CAST(#{bindings} AS JSONB),
+            error_code = NULL,
+            error_message = NULL,
+            finished_at = NULL,
+            orchestration_updated_at = #{now},
+            updated_at = #{now}
+        WHERE id = #{nodeExecutionId}
+          AND status = 5
+    </update>
+
+</mapper>

@@ -5,16 +5,15 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.staterelay.contract.dag.DagDefinition;
 import com.staterelay.contract.dag.StartDagInstanceRequest;
 import com.staterelay.contract.dag.enums.DagDefinitionVersionStatus;
-import com.staterelay.contract.dag.enums.DagInstanceOrchestrationState;
 import com.staterelay.contract.dag.enums.DagInstanceStatus;
 import com.staterelay.server.dag.entity.DagDefinitionEntity;
 import com.staterelay.server.dag.entity.DagDefinitionVersionEntity;
 import com.staterelay.server.dag.entity.DagInstanceEntity;
-import com.staterelay.server.dag.entity.DagNodeExecutionEntity;
+import com.staterelay.server.dag.entity.NodeInstanceEntity;
 import com.staterelay.server.dag.mapper.DagInstanceMapper;
-import com.staterelay.server.dag.mapper.DagNodeExecutionMapper;
+import com.staterelay.server.dag.mapper.NodeInstanceMapper;
 import com.staterelay.server.dag.repository.DagInstanceRepository;
-import com.staterelay.server.dag.repository.DagNodeExecutionJpaRepository;
+import com.staterelay.server.dag.repository.NodeInstanceJpaRepository;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -24,45 +23,52 @@ import java.util.List;
 import java.util.Optional;
 
 /**
- * DAG 实例 Service，负责启动实例（幂等）、查询实例状态、取消实例。
+ * DAG 实例 Service。
  *
+ * <p>对齐文档 §14：
+ * <ol>
+ *   <li>创建 DagInstance（status = INIT）</li>
+ *   <li>同事务批量创建全部 NodeInstance（统一初始化为 WAITING，不解析拓扑）</li>
+ *   <li>同事务 CAS DagInstance: INIT → RUNNING</li>
+ * </ol>
+ *
+ * <p>避免出现"实例 RUNNING 但节点还没建好"的不一致窗口。
  */
 @Service
 public class DagInstanceService {
 
-    private static final DagInstanceStatus STATUS_PENDING = DagInstanceStatus.PENDING;
-    private static final DagInstanceStatus STATUS_RUNNING = DagInstanceStatus.RUNNING;
-    private static final DagInstanceStatus STATUS_CANCELLING = DagInstanceStatus.CANCELLING;
-    private static final DagInstanceStatus STATUS_CANCELLED = DagInstanceStatus.CANCELLED;
-    private static final DagInstanceStatus STATUS_SUCCESS = DagInstanceStatus.SUCCESS;
-    private static final DagInstanceStatus STATUS_FAILED = DagInstanceStatus.FAILED;
-
-    private static final Duration DEFAULT_LEASE = Duration.ofSeconds(60);
     private static final Duration DEFAULT_NEXT_SCHEDULE_DELAY = Duration.ofSeconds(5);
 
     private final DagDefinitionService definitionService;
     private final DagInstanceRepository instanceRepository;
-    private final DagNodeExecutionJpaRepository nodeExecutionRepository;
+    private final NodeInstanceJpaRepository nodeInstanceRepository;
     private final DagInstanceMapper instanceMapper;
-    private final DagNodeExecutionMapper nodeExecutionMapper;
+    private final NodeInstanceMapper nodeInstanceMapper;
     private final ObjectMapper objectMapper;
 
     public DagInstanceService(DagDefinitionService definitionService,
                               DagInstanceRepository instanceRepository,
-                              DagNodeExecutionJpaRepository nodeExecutionRepository,
+                              NodeInstanceJpaRepository nodeInstanceRepository,
                               DagInstanceMapper instanceMapper,
-                              DagNodeExecutionMapper nodeExecutionMapper,
+                              NodeInstanceMapper nodeInstanceMapper,
                               ObjectMapper objectMapper) {
         this.definitionService = definitionService;
         this.instanceRepository = instanceRepository;
-        this.nodeExecutionRepository = nodeExecutionRepository;
+        this.nodeInstanceRepository = nodeInstanceRepository;
         this.instanceMapper = instanceMapper;
-        this.nodeExecutionMapper = nodeExecutionMapper;
+        this.nodeInstanceMapper = nodeInstanceMapper;
         this.objectMapper = objectMapper;
     }
 
     /**
      * 启动 DAG 实例（幂等：相同 idempotency_key 直接返回已存在的实例）。
+     *
+     * <p>事务内：
+     * <ol>
+     *   <li>创建 DagInstance（INIT）</li>
+     *   <li>批量创建全部 NodeInstance（WAITING）</li>
+     *   <li>CAS DagInstance: INIT → RUNNING</li>
+     * </ol>
      */
     @Transactional
     public DagInstanceEntity startInstance(Long appId, StartDagInstanceRequest request) {
@@ -82,12 +88,14 @@ public class DagInstanceService {
             version = definitionService.findLatestPublished(definition.getId())
                 .orElseThrow(() -> new IllegalStateException("No published version for dag: " + request.getDagCode()));
         }
-        if (!DagDefinitionVersionStatus.PUBLISHED.equals(version.getStatus())) {
-            throw new IllegalStateException("DAG version is not PUBLISHED: " + version.getId());
+        // 对齐文档 §3.2 / §29：只有 ENABLED 状态的 DagDefinition 才允许创建 DagInstance
+        if (!DagDefinitionVersionStatus.ENABLED.equals(version.getStatus())) {
+            throw new IllegalStateException("DAG version is not ENABLED: " + version.getId());
         }
 
         DagDefinition snapshot = definitionService.loadSnapshot(version);
 
+        Instant now = Instant.now();
         DagInstanceEntity instance = new DagInstanceEntity();
         instance.setDagDefinitionVersionId(version.getId());
         instance.setDagCodeSnapshot(snapshot.getDagCode());
@@ -96,25 +104,29 @@ public class DagInstanceService {
         instance.setBusinessId(request.getBusinessId());
         instance.setIdempotencyKey(request.getIdempotencyKey());
         instance.setInputJson(writeJson(request.getInputs()));
-        instance.setStatus(STATUS_RUNNING);
-        instance.setOrchestrationState(DagInstanceOrchestrationState.READY);
-        instance.setOrchestrationVersion(0L);
-        Instant now = Instant.now();
+        instance.setStatus(DagInstanceStatus.INIT);
         instance.setNextScheduleTime(now.plus(DEFAULT_NEXT_SCHEDULE_DELAY));
-        instance.setStartedAt(now);
-        instance.setLeaseExpireTime(now.plus(DEFAULT_LEASE));
         instance.setTotalNodeCount(snapshot.getNodes().size());
         instance.setCreatedAt(now);
         instance.setUpdatedAt(now);
         DagInstanceEntity saved = instanceRepository.save(instance);
 
-        // 批量创建节点执行实例
+        // 同事务批量创建全部 NodeInstance，统一初始化为 WAITING，不解析拓扑（对齐文档 §5.1）
         if (snapshot.getNodes() != null && !snapshot.getNodes().isEmpty()) {
-            List<DagNodeExecutionMapper.NodeInsert> nodes = snapshot.getNodes().stream()
-                .map(n -> new DagNodeExecutionMapper.NodeInsert(n.getId(), n.getName(), n.getHandler()))
+            List<NodeInstanceMapper.NodeInsert> nodes = snapshot.getNodes().stream()
+                .map(n -> new NodeInstanceMapper.NodeInsert(n.getId(), n.getName(), n.getHandler()))
                 .toList();
-            nodeExecutionMapper.batchInsert(saved.getId(), nodes, now);
+            nodeInstanceMapper.batchInsert(saved.getId(), nodes, now);
         }
+
+        // NodeInstance 全部落盘后，CAS DagInstance: INIT → RUNNING（对齐文档 §14.2）
+        int started = instanceMapper.tryStartInstance(saved.getId(), now);
+        if (started == 0) {
+            throw new IllegalStateException("Failed to start DAG instance " + saved.getId()
+                + ": INIT → RUNNING CAS failed (concurrent start?)");
+        }
+        saved.setStatus(DagInstanceStatus.RUNNING);
+        saved.setStartedAt(now);
         return saved;
     }
 
@@ -128,24 +140,27 @@ public class DagInstanceService {
     /**
      * 查询 DAG 实例的所有节点。
      */
-    public List<DagNodeExecutionEntity> listNodes(Long instanceId) {
-        return nodeExecutionRepository.findByDagInstanceId(instanceId);
+    public List<NodeInstanceEntity> listNodes(Long instanceId) {
+        return nodeInstanceRepository.findByDagInstanceId(instanceId);
     }
 
     /**
-     * 取消 DAG 实例（status → CANCELLING, lease_version+1）。
-     * 节点取消交由 Orchestrator 在下一轮推进时处理。
+     * 取消 DAG 实例（对齐文档）：
+     * <ol>
+     *   <li>CAS DagInstance → CANCELLED(40)，lease_version+1</li>
+     *   <li>同事务把所有未终态节点 CAS 到 CANCELLED</li>
+     * </ol>
      */
     @Transactional
     public int cancelInstance(Long instanceId) {
-        return instanceMapper.cancelInstance(instanceId, Instant.now());
-    }
-
-    public DagInstanceEntity toRunning(DagInstanceEntity instance) {
-        if (STATUS_PENDING.equals(instance.getStatus())) {
-            instance.setStatus(STATUS_RUNNING);
+        Instant now = Instant.now();
+        int updated = instanceMapper.cancelInstance(instanceId, now);
+        if (updated > 0) {
+            // 取消成功，同时取消所有未终态节点
+            nodeInstanceMapper.cancelUnstartedNodes(instanceId, now);
+            nodeInstanceMapper.cancelRunningNodes(instanceId, now);
         }
-        return instance;
+        return updated;
     }
 
     private String writeJson(Object value) {

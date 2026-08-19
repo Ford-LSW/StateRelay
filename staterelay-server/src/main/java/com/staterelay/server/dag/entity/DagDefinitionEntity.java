@@ -36,6 +36,12 @@ public class DagDefinitionEntity {
     @Column(name = "description", length = 1000)
     private String description;
 
+    /**
+     * 完整DAG定义
+     */
+    @Column(name = "def_json", columnDefinition = "jsonb")
+    private String definitionJson;
+
     @Column(name = "enabled", nullable = false)
     private boolean enabled = true;
 

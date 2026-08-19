@@ -12,7 +12,9 @@ import java.time.Instant;
 import java.util.List;
 
 /**
- * DAG Orchestrator Scanner，定时扫描可推进的 DAG 实例并提交到线程池。
+ * DAG Engine Scanner（对齐文档 §19.2 轮询模型）。
+ *
+ * <p>周期扫描 RUNNING 实例，提交到线程池推进后继节点 WAITING → READY。
  *
  * <p>使用 {@code FOR UPDATE SKIP LOCKED} 避免多实例重复领取。
  */
@@ -37,11 +39,11 @@ public class DagOrchestratorScanner {
     public void scan() {
         Instant now = Instant.now();
         try {
-            List<DagInstanceLease> due = instanceMapper.scanDueInstances(now, batchSize);
+            List<DagInstanceLease> due = instanceMapper.scanRunningInstances(now, batchSize);
             if (due.isEmpty()) {
                 return;
             }
-            log.debug("Found {} due DAG instances", due.size());
+            log.debug("Found {} RUNNING DAG instances to advance", due.size());
             for (DagInstanceLease lease : due) {
                 try {
                     executor.submit(lease);
