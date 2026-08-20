@@ -67,7 +67,9 @@ public interface NodeAttemptMapper {
     int markUnknown(@Param("attemptId") Long attemptId, @Param("now") Instant now);
 
     /**
-     * 扫描 RUNNING(30) 且超时的 Attempt（Scheduler 超时检测）。
+     * 扫描 RUNNING(30) 且超时的 Attempt（Scheduler 超时检测，§29.4）。
+     *
+     * <p>判定条件：{@code now - started_at > timeout_seconds}，timeout_seconds 取自 AlgorithmDefinition。
      */
     List<Long> scanTimeoutAttempts(@Param("now") Instant now, @Param("batchSize") int batchSize);
 
@@ -75,6 +77,24 @@ public interface NodeAttemptMapper {
      * 扫描终态但未处理的 Attempt（DAG Engine 推进 NodeInstance）。
      */
     List<Long> scanTerminalAttempts(@Param("now") Instant now, @Param("batchSize") int batchSize);
+
+    /**
+     * 扫描 UNKNOWN(80) 且达到收敛窗口阈值的 Attempt（§19.1 / §29.5）。
+     *
+     * <p>对齐文档 §19.1：UNKNOWN 状态在 2×timeout_seconds 后未收到任何反馈，
+     * 则视为最终 TIMEOUT，避免永久卡住。
+     *
+     * <p>调用方根据 AlgorithmDefinition.timeout_seconds 计算截止时间：
+     * {@code now - finished_at > 2 * timeout_seconds}
+     */
+    List<Long> scanUnknownAttempts(@Param("now") Instant now, @Param("batchSize") int batchSize);
+
+    /**
+     * CAS: UNKNOWN(80) → TIMEOUT(70)（UNKNOWN 收敛，§19.1）。
+     *
+     * <p>调用方在确认达到收敛窗口后调用，使 NodeAttemptSyncService 能将其作为 TIMEOUT 处理。
+     */
+    int markUnknownAsTimeout(@Param("attemptId") Long attemptId, @Param("now") Instant now);
 
     /**
      * 用于插入的参数。

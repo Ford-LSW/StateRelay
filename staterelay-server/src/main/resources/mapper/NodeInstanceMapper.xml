@@ -3,50 +3,53 @@
         "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
 <mapper namespace="com.staterelay.server.dag.mapper.NodeInstanceMapper">
 
+    <resultMap id="NodeInstanceLeaseMap" type="com.staterelay.server.dag.mapper.dto.NodeInstanceLease">
+        <id     property="id"                       column="id"/>
+        <result property="dagInstanceId"            column="dag_instance_id"/>
+        <result property="nodeId"                   column="node_id"/>
+        <result property="nodeName"                 column="node_name"/>
+        <result property="handlerName"              column="handler_name"/>
+        <result property="dispatchOwner"             column="dispatch_owner"/>
+        <result property="dispatchLeaseExpireTime"  column="dispatch_lease_expire_time"/>
+    </resultMap>
+
     <resultMap id="NodeCompletionSnapshotMap" type="com.staterelay.server.dag.mapper.dto.NodeCompletionSnapshot">
-        <id     property="nodeExecutionId"     column="id"/>
-        <result property="dagInstanceId"      column="dag_instance_id"/>
-        <result property="nodeId"             column="node_id"/>
-        <result property="handlerName"        column="handler_name_snapshot"/>
-        <result property="finishedAt"         column="finished_at"/>
+        <id     property="id"               column="id"/>
+        <result property="dagInstanceId"     column="dag_instance_id"/>
+        <result property="nodeId"            column="node_id"/>
+        <result property="handlerName"      column="handler_name"/>
+        <result property="resultJson"        column="result_json"/>
+        <result property="resultRef"         column="result_ref"/>
     </resultMap>
 
-    <resultMap id="NodeStatusCountMap" type="com.staterelay.server.dag.mapper.NodeInstanceMapper$NodeStatusCount">
-        <result property="totalCount"    column="total_count"/>
-        <result property="successCount"  column="success_count"/>
-        <result property="failedCount"   column="failed_count"/>
-        <result property="skippedCount"  column="skipped_count"/>
-        <result property="activeCount"   column="active_count"/>
-    </resultMap>
-
-    <!-- 批量插入节点实例（统一初始化为 WAITING(0)） -->
+    <!-- 批量创建节点实例，统一初始化为 WAITING(0) -->
     <insert id="batchInsert">
         INSERT INTO sr_dag_node_instance
-            (dag_instance_id, node_id, node_name_snapshot, handler_name_snapshot,
-             status, version, created_at, updated_at)
+            (dag_instance_id, node_id, node_name, handler_name, status,
+             retry_count, current_attempt_no, schedule_fail_count,
+             created_at, updated_at)
         VALUES
         <foreach collection="nodes" item="n" separator=",">
-            (#{dagInstanceId}, #{n.nodeId}, #{n.nodeName}, #{n.handlerName},
-             0, 0, #{now}, #{now})
+            (#{dagInstanceId}, #{n.nodeId}, #{n.nodeName}, #{n.handlerName}, 0,
+             0, 0, 0,
+             #{now}, #{now})
         </foreach>
     </insert>
 
     <!-- 查询可推进到 READY 的 WAITING 节点：
-         无前驱的根节点（NOT EXISTS 天然成立）或前驱全部 SUCCESS(50) 的后继节点。
-         status: 0=WAITING, 50=SUCCESS -->
-    <select id="findReadyableNodes" resultType="java.lang.Long">
+         1. 无前驱的根节点
+         2. 前驱全部 SUCCESS 的后继节点 -->
+    <select id="findReadyableNodes" resultType="long">
         SELECT ni.id
         FROM sr_dag_node_instance ni
-        JOIN sr_dag_instance di ON di.id = ni.dag_instance_id
         WHERE ni.dag_instance_id = #{dagInstanceId}
           AND ni.status = 0
           AND NOT EXISTS (
               SELECT 1
-              FROM sr_dag_edge e
-              JOIN sr_dag_node_instance pred
-                ON pred.dag_instance_id = ni.dag_instance_id
-               AND pred.node_id = e.from_node_id
-              WHERE e.dag_definition_version_id = di.dag_definition_version_id
+              FROM sr_dag_node_edge e
+              JOIN sr_dag_node_instance pred ON pred.dag_instance_id = e.dag_instance_id
+                                            AND pred.node_id = e.from_node_id
+              WHERE e.dag_instance_id = #{dagInstanceId}
                 AND e.to_node_id = ni.node_id
                 AND pred.status != 50
           )
@@ -56,105 +59,168 @@
     <update id="markReady">
         UPDATE sr_dag_node_instance
         SET status = 10,
-            input_bindings_snapshot = CAST(#{bindings} AS JSONB),
-            ready_at = #{now},
-            version = version + 1,
+            bindings = #{bindings},
+            last_progress_time = #{now},
             updated_at = #{now}
         WHERE id = #{nodeInstanceId}
           AND status = 0
     </update>
 
-    <!-- CAS: READY(10) → DISPATCHING(20)（Scheduler 抢占） -->
+    <!-- Scheduler 扫描可领取的 READY 节点（§26） -->
+    <select id="scanReadyNodes" resultMap="NodeInstanceLeaseMap">
+        SELECT id, dag_instance_id, node_id, node_name, handler_name,
+               dispatch_owner, dispatch_lease_expire_time
+        FROM sr_dag_node_instance
+        WHERE status = 10
+          AND (next_schedule_time IS NULL OR next_schedule_time &lt;= #{now})
+        ORDER BY next_schedule_time, id
+        LIMIT #{batchSize}
+        FOR UPDATE SKIP LOCKED
+    </select>
+
+    <!-- CAS: READY(10) → DISPATCHING(20)（Scheduler 抢占，§26） -->
     <update id="claimForDispatch">
         UPDATE sr_dag_node_instance
         SET status = 20,
             dispatch_owner = #{dispatchOwner},
             dispatch_lease_expire_time = #{dispatchLeaseExpireTime},
-            version = version + 1,
+            last_progress_time = #{now},
             updated_at = #{now}
         WHERE id = #{nodeInstanceId}
           AND status = 10
     </update>
 
-    <!-- CAS: DISPATCHING(20) → DISPATCHED(30) -->
+    <!-- CAS: DISPATCHING(20) → DISPATCHED(30)（仅异步模式使用） -->
     <update id="markDispatched">
         UPDATE sr_dag_node_instance
         SET status = 30,
-            dispatched_at = #{now},
-            version = version + 1,
+            last_progress_time = #{now},
             updated_at = #{now}
         WHERE id = #{nodeInstanceId}
           AND status = 20
     </update>
 
-    <!-- CAS: DISPATCHED(30) → RUNNING(40)（Worker ACK） -->
+    <!-- CAS: DISPATCHING(20) / DISPATCHED(30) → RUNNING(40)
+         对齐文档 §11：同步模式跳过 DISPATCHED，由 DISPATCHING 直接到 RUNNING -->
     <update id="markRunning">
         UPDATE sr_dag_node_instance
         SET status = 40,
-            started_at = COALESCE(started_at, #{now}),
-            version = version + 1,
+            dispatch_owner = NULL,
+            dispatch_lease_expire_time = NULL,
+            last_progress_time = #{now},
             updated_at = #{now}
         WHERE id = #{nodeInstanceId}
-          AND status = 30
+          AND status IN (20, 30)
     </update>
 
-    <!-- CAS: RUNNING(40) → SUCCESS(50)，返回快照 -->
+    <!-- CAS: RUNNING(40) → SUCCESS(50) -->
     <select id="markSuccess" resultMap="NodeCompletionSnapshotMap">
         UPDATE sr_dag_node_instance
         SET status = 50,
-            result_json = CAST(#{resultJson} AS JSONB),
+            result_json = #{resultJson},
             result_ref = #{resultRef},
-            finished_at = #{now},
-            version = version + 1,
+            last_progress_time = #{now},
             updated_at = #{now}
         WHERE id = #{nodeInstanceId}
           AND status = 40
-        RETURNING id, dag_instance_id, node_id, handler_name_snapshot, finished_at
+        RETURNING id, dag_instance_id, node_id, handler_name, result_json, result_ref
     </select>
 
-    <!-- CAS: RUNNING(40) → FAILED(60) -->
+    <!-- CAS: RUNNING(40) → FAILED(60)（执行失败且重试耗尽，§29.3） -->
     <update id="markFailed">
         UPDATE sr_dag_node_instance
         SET status = 60,
             error_code = #{errorCode},
             error_message = #{errorMessage},
-            finished_at = #{now},
-            version = version + 1,
+            last_progress_time = #{now},
             updated_at = #{now}
         WHERE id = #{nodeInstanceId}
           AND status = 40
+    </update>
+
+    <!-- CAS: RUNNING(40) → TIMEOUT(90)（执行超时且重试耗尽，§29.4） -->
+    <update id="markTimeout">
+        UPDATE sr_dag_node_instance
+        SET status = 90,
+            error_code = #{errorCode},
+            error_message = #{errorMessage},
+            last_progress_time = #{now},
+            updated_at = #{now}
+        WHERE id = #{nodeInstanceId}
+          AND status = 40
+    </update>
+
+    <!-- CAS: DISPATCHING(20) → FAILED(60)（参数解析失败，§17）
+         参数解析失败属于配置错误，不重试 -->
+    <update id="markFailedFromDispatching">
+        UPDATE sr_dag_node_instance
+        SET status = 60,
+            error_code = #{errorCode},
+            error_message = #{errorMessage},
+            last_progress_time = #{now},
+            updated_at = #{now}
+        WHERE id = #{nodeInstanceId}
+          AND status = 20
+    </update>
+
+    <!-- CAS: DISPATCHING(20) → FAILED(60)（无可用 Worker 且达上限，§9.1 / §27 step 5） -->
+    <update id="markFailedForNoWorker">
+        UPDATE sr_dag_node_instance
+        SET status = 60,
+            schedule_fail_count = #{scheduleFailCount},
+            error_code = #{errorCode},
+            error_message = #{errorMessage},
+            last_progress_time = #{now},
+            updated_at = #{now}
+        WHERE id = #{nodeInstanceId}
+          AND status = 20
     </update>
 
     <!-- CAS: WAITING(0) → SKIPPED(80) -->
     <update id="markSkipped">
         UPDATE sr_dag_node_instance
         SET status = 80,
-            finished_at = #{now},
-            version = version + 1,
+            last_progress_time = #{now},
             updated_at = #{now}
         WHERE id = #{nodeInstanceId}
           AND status = 0
     </update>
 
-    <!-- CAS: 回退到 READY(10)（从 DISPATCHING/DISPATCHED/RUNNING/TIMEOUT 回退） -->
+    <!-- CAS: 回退到 READY(10)（重试，§29.2 / §29.4）
+         retry_count 和 current_attempt_no 自增 -->
     <update id="revertToReady">
         UPDATE sr_dag_node_instance
         SET status = 10,
-            retry_count = #{retryCount},
-            current_attempt_no = #{currentAttemptNo},
-            next_schedule_time = #{nextScheduleTime},
+            retry_count = retry_count + 1,
+            current_attempt_no = current_attempt_no + 1,
             dispatch_owner = NULL,
             dispatch_lease_expire_time = NULL,
-            error_code = NULL,
-            error_message = NULL,
-            version = version + 1,
+            next_schedule_time = #{nextScheduleTime},
+            last_progress_time = #{now},
             updated_at = #{now}
         WHERE id = #{nodeInstanceId}
           AND status IN (20, 30, 40, 90)
     </update>
 
-    <!-- 扫描 DISPATCHING(20) 卡住节点 -->
-    <select id="scanStuckDispatching" resultType="java.lang.Long">
+    <!-- CAS: DISPATCHING(20) → READY(10)（无可用 Worker 但未达上限，§27 step 5）
+         schedule_fail_count 自增；不创建 NodeAttempt，不增加 retry_count -->
+    <update id="revertToReadyForNoWorker">
+        UPDATE sr_dag_node_instance
+        SET status = 10,
+            schedule_fail_count = schedule_fail_count + 1,
+            last_schedule_error_code = #{errorCode},
+            last_schedule_error_message = #{errorMessage},
+            dispatch_owner = NULL,
+            dispatch_lease_expire_time = NULL,
+            next_schedule_time = #{nextScheduleTime},
+            last_progress_time = #{now},
+            updated_at = #{now}
+        WHERE id = #{nodeInstanceId}
+          AND status = 20
+    </update>
+
+    <!-- 扫描 DISPATCHING 卡住节点（dispatch_lease_expire_time 过期） -->
+    <select id="scanStuckDispatching" resultType="long">
         SELECT id
         FROM sr_dag_node_instance
         WHERE status = 20
@@ -164,36 +230,41 @@
         FOR UPDATE SKIP LOCKED
     </select>
 
-    <!-- 取消未启动节点（WAITING/READY/DISPATCHING/DISPATCHED → CANCELLED） -->
+    <!-- 取消未开始节点（WAITING/READY/DISPATCHING → CANCELLED），写 cancel_reason（§33.3 / §33.6 步骤 2） -->
     <update id="cancelUnstartedNodes">
         UPDATE sr_dag_node_instance
         SET status = 70,
-            finished_at = #{now},
-            version = version + 1,
+            cancel_reason = #{cancelReason},
+            dispatch_owner = NULL,
+            dispatch_lease_expire_time = NULL,
+            last_progress_time = #{now},
             updated_at = #{now}
         WHERE dag_instance_id = #{dagInstanceId}
-          AND status IN (0, 10, 20, 30)
+          AND status IN (0, 10, 20)
     </update>
 
-    <!-- 取消运行中节点（RUNNING → CANCELLED） -->
+    <!-- 取消运行中节点（RUNNING → CANCELLED），写 cancel_reason（§33.4 / §33.6 步骤 3）
+         仅 Scheduler 调 Worker cancel 成功后调用 -->
     <update id="cancelRunningNodes">
         UPDATE sr_dag_node_instance
         SET status = 70,
-            finished_at = #{now},
-            version = version + 1,
+            cancel_reason = #{cancelReason},
+            last_progress_time = #{now},
             updated_at = #{now}
         WHERE dag_instance_id = #{dagInstanceId}
           AND status = 40
     </update>
 
     <!-- 统计实例下各状态节点数 -->
-    <select id="countByStatus" resultMap="NodeStatusCountMap">
+    <select id="countByStatus" resultType="com.staterelay.server.dag.mapper.NodeInstanceMapper$NodeStatusCount">
         SELECT
             COUNT(*) AS total_count,
             COUNT(*) FILTER (WHERE status = 50) AS success_count,
             COUNT(*) FILTER (WHERE status = 60) AS failed_count,
+            COUNT(*) FILTER (WHERE status = 90) AS timeout_count,
+            COUNT(*) FILTER (WHERE status = 70) AS cancelled_count,
             COUNT(*) FILTER (WHERE status = 80) AS skipped_count,
-            COUNT(*) FILTER (WHERE status IN (0, 10, 20, 30, 40, 90)) AS active_count
+            COUNT(*) FILTER (WHERE status NOT IN (50, 60, 70, 80, 90)) AS active_count
         FROM sr_dag_node_instance
         WHERE dag_instance_id = #{dagInstanceId}
     </select>

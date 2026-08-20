@@ -12,9 +12,14 @@ import java.time.Instant;
 import java.util.List;
 
 /**
- * DAG Engine Scanner（对齐文档 §19.2 轮询模型）。
+ * DAG Engine Scanner（对齐文档 §19.2 轮询模型 / §25.1 / §35.1）。
  *
- * <p>周期扫描 RUNNING 实例，提交到线程池推进后继节点 WAITING → READY。
+ * <p>周期扫描活跃实例（RUNNING / CANCELLING / FAILING），提交到线程池由 DagOrchestratorService 分流推进：
+ * <ul>
+ *   <li>RUNNING：推进 READY 节点；检测 FAILED/TIMEOUT 触发 FAILING；全 SUCCESS → SUCCESS</li>
+ *   <li>CANCELLING：等待 RUNNING 节点收敛到 CANCELLED；全终态 → CANCELLED</li>
+ *   <li>FAILING：等待清理完成；全终态 → FAILED</li>
+ * </ul>
  *
  * <p>使用 {@code FOR UPDATE SKIP LOCKED} 避免多实例重复领取。
  */
@@ -39,11 +44,11 @@ public class DagOrchestratorScanner {
     public void scan() {
         Instant now = Instant.now();
         try {
-            List<DagInstanceLease> due = instanceMapper.scanRunningInstances(now, batchSize);
+            List<DagInstanceLease> due = instanceMapper.scanActiveInstances(now, batchSize);
             if (due.isEmpty()) {
                 return;
             }
-            log.debug("Found {} RUNNING DAG instances to advance", due.size());
+            log.debug("Found {} active DAG instances to advance (RUNNING/CANCELLING/FAILING)", due.size());
             for (DagInstanceLease lease : due) {
                 try {
                     executor.submit(lease);

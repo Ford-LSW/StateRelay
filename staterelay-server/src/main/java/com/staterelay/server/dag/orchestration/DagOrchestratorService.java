@@ -19,15 +19,20 @@ import java.time.Instant;
 import java.util.List;
 
 /**
- * DAG Engine 核心 Service（对齐文档 §19.2 轮询模型）。
+ * DAG Engine 核心 Service（对齐文档 §19.2 轮询模型 / §25.1 / §31.1 / §33.6 / §35.1 / §37.2）。
  *
- * <p>每轮推进职责：
+ * <p>scanner 每轮领取活跃 DagInstance（RUNNING / CANCELLING / FAILING），按状态分流推进：
+ * <ul>
+ *   <li>RUNNING：推进 READY 节点；检测 FAILED/TIMEOUT 触发 FAILING 启动事务；判断全终态推进 SUCCESS</li>
+ *   <li>CANCELLING：判断 RUNNING 节点是否全部终态（由 Scheduler 调 Worker cancel 完成）；满足后 CAS CANCELLING → CANCELLED</li>
+ *   <li>FAILING：判断清理完成；CAS FAILING → FAILED</li>
+ * </ul>
+ *
+ * <p>终态判断顺序（§35.1）：CANCELLING > FAILED > SUCCESS
  * <ol>
- *   <li>处理取消中的实例（NodeInstance 链式 CANCELLED → DagInstance CANCELLED）</li>
- *   <li>同步 Attempt 终态到 NodeInstance（§19.1 事务）</li>
- *   <li>推进后继节点 WAITING → READY（含根节点首轮推进）</li>
- *   <li>链式跳过：FAILED 节点的后继 → SKIPPED（§20.2）</li>
- *   <li>终态化 DagInstance（§22）</li>
+ *   <li>若存在 CANCELLED 节点 → 走 CANCELLING/CANCELLED 收敛路径</li>
+ *   <li>否则若存在 FAILED/TIMEOUT 节点 → 走 FAILING/FAILED 收敛路径</li>
+ *   <li>否则若全节点 SUCCESS → SUCCESS</li>
  * </ol>
  *
  * <p>所有推进均使用 CAS，幂等：CAS 失败说明已被其他 Engine 实例处理，跳过即可。
@@ -59,34 +64,148 @@ public class DagOrchestratorService {
     }
 
     /**
-     * 推进一个 RUNNING 的 DAG 实例（对齐文档 §19.2 轮询模型）。
+     * 推进一个活跃的 DAG 实例（对齐文档 §19.2 轮询模型 / §35.1 状态分流）。
      *
-     * <p>scanner 仅扫 RUNNING 实例；CANCELLED 实例的节点取消在 cancel API 同事务内完成。
+     * <p>scanner 领取 RUNNING / CANCELLING / FAILING 三种状态，统一进入此方法。
+     *
+     * <p>NodeAttempt 终态 → NodeInstance 推进由 NodeAttemptSyncService 独立 @Scheduled 完成（§19.1）。
      */
     @Transactional
     public void advanceInstance(Long dagInstanceId) {
         DagInstanceEntity instance = instanceRepository.findById(dagInstanceId)
             .orElseThrow(() -> new IllegalStateException("DAG instance not found: " + dagInstanceId));
 
-        if (instance.getStatus() != DagInstanceStatus.RUNNING) {
-            return;  // scanner 仅领取 RUNNING，理论上不会进入其他分支
+        DagInstanceStatus status = instance.getStatus();
+        if (status == null || !status.isActive()) {
+            return;  // 已终态，跳过
         }
-        advanceRunning(instance);
+        switch (status) {
+            case RUNNING -> advanceRunning(instance);
+            case CANCELLING -> advanceCancelling(instance);
+            case FAILING -> advanceFailing(instance);
+            default -> { /* 不会到这里 */ }
+        }
     }
 
+    /**
+     * RUNNING 推进（对齐文档 §35.1 判断顺序）：
+     * <ol>
+     *   <li>推进后继节点 WAITING → READY（含根节点首轮推进，§5.1 + §20）</li>
+     *   <li>若存在 FAILED/TIMEOUT 节点 → 立即启动 FAILING 事务（§31.1 / §39.1 T7），
+     *       不等待其余 RUNNING 节点收敛；剩余节点由 Scheduler 协作式取消推进</li>
+     *   <li>若全节点 SUCCESS → CAS RUNNING → SUCCESS</li>
+     *   <li>否则仍有未终态节点且无失败 → 维持 RUNNING，等下一轮</li>
+     * </ol>
+     *
+     * <p>关键修正（对齐 §35.1）：FAILING 触发条件是"任意节点 FAILED/TIMEOUT"，
+     * <b>不是</b>"全部节点终态后存在 FAILED"。后者会导致：
+     * A FAILED + B WAITING（前驱失败）→ 永远 activeCount &gt; 0 → 永远不进入 FAILING。
+     */
     private void advanceRunning(DagInstanceEntity instance) {
         Instant now = Instant.now();
 
-        // NodeAttempt 终态 → NodeInstance 推进由 NodeAttemptSyncService 独立 @Scheduled 完成（§19.1 + §19.2 轮询）
-
         // 1. 推进后继节点 WAITING → READY（含根节点首轮推进，§5.1 + §20）
+        // 注意：findReadyableNodes 只返回前驱全部 SUCCESS 的节点，
+        // 因此前驱失败的 WAITING 节点不会被推进（替代了原 skipDescendantsOfFailed 的职责，§20.2）
         advanceReadyableNodes(instance, now);
 
-        // 2. 链式跳过 FAILED 节点的后继（§20.2）
-        skipDescendantsOfFailed(instance, now);
+        // 2. 终态化判断（§35.1 判断顺序：CANCELLING > FAILED > SUCCESS）
+        NodeInstanceMapper.NodeStatusCount count = nodeInstanceMapper.countByStatus(instance.getId());
+        if (count == null) {
+            return;
+        }
+        int failedCount = (count.getFailedCount() == null ? 0 : count.getFailedCount())
+                + (count.getTimeoutCount() == null ? 0 : count.getTimeoutCount());
 
-        // 3. 终态化 DagInstance（§22）
-        tryFinalizeInstance(instance, now);
+        // §35.1 步骤 3：存在 FAILED/TIMEOUT 节点 → 立即启动 FAILING（不等剩余节点收敛）
+        if (failedCount > 0) {
+            int started = instanceMapper.startFailing(instance.getId(), now);
+            if (started == 0) {
+                // 已被其他流程推进（用户取消 → CANCELLING），不再处理
+                return;
+            }
+            // FAILING 启动后，由 advanceFailing 完成终态化（CAS FAILING → FAILED）
+            DagInstanceEntity refreshed = instanceRepository.findById(instance.getId()).orElse(null);
+            if (refreshed != null) {
+                advanceFailing(refreshed);
+            }
+            return;
+        }
+
+        // §35.1 步骤 4：全节点 SUCCESS → RUNNING → SUCCESS
+        // 否则：仍有未终态节点且无失败 → 维持 RUNNING，等下一轮
+        if (count.getActiveCount() != null && count.getActiveCount() > 0) {
+            return;
+        }
+        finalizeAs(instance, DagInstanceStatus.RUNNING, DagInstanceStatus.SUCCESS, count, now);
+    }
+
+    /**
+     * CANCELLING 推进：
+     * <p>等待 Scheduler 把所有 RUNNING 节点 cancel 到 CANCELLED（§33.6 步骤 3）。
+     * 一旦所有节点都进入终态，CAS CANCELLING → CANCELLED。
+     */
+    private void advanceCancelling(DagInstanceEntity instance) {
+        Instant now = Instant.now();
+        NodeInstanceMapper.NodeStatusCount count = nodeInstanceMapper.countByStatus(instance.getId());
+        if (count == null) {
+            return;
+        }
+        if (count.getActiveCount() != null && count.getActiveCount() > 0) {
+            return;  // 仍有 RUNNING 节点未收敛
+        }
+        // 全部节点终态，CAS CANCELLING → CANCELLED
+        finalizeAs(instance, DagInstanceStatus.CANCELLING, DagInstanceStatus.CANCELLED, count, now);
+    }
+
+    /**
+     * FAILING 推进：
+     * <p>等待清理完成（无未终态节点）。一旦全终态，CAS FAILING → FAILED。
+     *
+     * <p>注意：进入 FAILING 前必然存在 FAILED/TIMEOUT 节点，所以这里直接走 FAILED 终态化。
+     */
+    private void advanceFailing(DagInstanceEntity instance) {
+        Instant now = Instant.now();
+        NodeInstanceMapper.NodeStatusCount count = nodeInstanceMapper.countByStatus(instance.getId());
+        if (count == null) {
+            return;
+        }
+        if (count.getActiveCount() != null && count.getActiveCount() > 0) {
+            return;  // 仍有未终态节点，等下一轮
+        }
+        // CAS FAILING → FAILED
+        finalizeAs(instance, DagInstanceStatus.FAILING, DagInstanceStatus.FAILED, count, now);
+    }
+
+    /**
+     * 终态化 DagInstance：CAS expectedFrom → finalStatus，写计数。
+     */
+    private void finalizeAs(DagInstanceEntity instance,
+                            DagInstanceStatus expectedFrom,
+                            DagInstanceStatus finalStatus,
+                            NodeInstanceMapper.NodeStatusCount count,
+                            Instant now) {
+        String errorCode = null;
+        String errorMessage = null;
+        if (finalStatus == DagInstanceStatus.FAILED) {
+            errorCode = "NODE_FAILED";
+            errorMessage = "DAG failed: " + (count.getFailedCount() == null ? 0 : count.getFailedCount())
+                    + " failed, " + (count.getTimeoutCount() == null ? 0 : count.getTimeoutCount()) + " timeout";
+        }
+        int updated = instanceMapper.finalizeInstance(
+            instance.getId(),
+            expectedFrom,
+            finalStatus,
+            count.getSuccessCount() == null ? 0 : count.getSuccessCount(),
+            (count.getFailedCount() == null ? 0 : count.getFailedCount())
+                + (count.getTimeoutCount() == null ? 0 : count.getTimeoutCount()),
+            count.getSkippedCount() == null ? 0 : count.getSkippedCount(),
+            errorCode,
+            errorMessage,
+            now);
+        if (updated > 0) {
+            log.info("DAG instance {} finalized as {} (from {})", instance.getId(), finalStatus, expectedFrom);
+        }
     }
 
     /**
@@ -116,87 +235,8 @@ public class DagOrchestratorService {
             String bindings = bindingResolver.resolveBindings(instance, versionLite, dagNode);
             int updated = nodeInstanceMapper.markReady(nodeInstanceId, bindings, now);
             if (updated > 0) {
-                log.debug("Node {} of DAG instance {} advanced WAITING → READY",
-                    node.getNodeId(), instance.getId());
+                log.debug("Node {} of DAG instance {} advanced WAITING → READY", node.getNodeId(), instance.getId());
             }
-        }
-    }
-
-    /**
-     * 链式跳过 FAILED 节点的后继（§20.2）。
-     *
-     * <p>规则：若某 WAITING 节点的所有前驱均为 FAILED/SKIPPED（无可成功路径），则 CAS → SKIPPED。
-     * 通过 {@link NodeInstanceMapper#findReadyableNodes} 反向查询"无法推进且存在前驱的 WAITING 节点"，
-     * 简化实现：扫描 WAITING 节点中前驱全部为终态失败（FAILED/SKIPPED）的节点。
-     *
-     * <p>根节点（无前驱）天然不会被跳过，因为 {@code hasAnyPred=false} 直接返回 false。
-     */
-    private void skipDescendantsOfFailed(DagInstanceEntity instance, Instant now) {
-        List<NodeInstanceEntity> waitingNodes = nodeInstanceRepository
-            .findByDagInstanceIdAndStatusIn(instance.getId(), List.of(NodeInstanceStatus.WAITING));
-        if (waitingNodes.isEmpty()) {
-            return;
-        }
-        BindingResolver.DagDefinitionVersionLite versionLite = loadVersionLite(instance);
-        if (versionLite == null || versionLite.getSnapshot().getEdges() == null) {
-            return;
-        }
-        List<NodeInstanceEntity> all = nodeInstanceRepository.findByDagInstanceId(instance.getId());
-        for (NodeInstanceEntity node : waitingNodes) {
-            if (allPredecessorsFailed(versionLite, all, node.getNodeId())) {
-                int updated = nodeInstanceMapper.markSkipped(node.getId(), now);
-                if (updated > 0) {
-                    log.debug("Node {} of DAG instance {} skipped (predecessors all failed)",
-                        node.getNodeId(), instance.getId());
-                }
-            }
-        }
-    }
-
-    /**
-     * 判断指定节点的所有前驱是否均为 FAILED/SKIPPED。
-     * 根节点（无前驱）返回 false（不跳过）。
-     */
-    private boolean allPredecessorsFailed(BindingResolver.DagDefinitionVersionLite versionLite,
-                                          List<NodeInstanceEntity> allNodes,
-                                          String nodeId) {
-        boolean hasAnyPred = false;
-        for (DagDefinition.DagEdge edge : versionLite.getSnapshot().getEdges()) {
-            if (!nodeId.equals(edge.getTo())) {
-                continue;
-            }
-            hasAnyPred = true;
-            for (NodeInstanceEntity pred : allNodes) {
-                if (pred.getNodeId().equals(edge.getFrom())) {
-                    if (pred.getStatus() != NodeInstanceStatus.FAILED
-                            && pred.getStatus() != NodeInstanceStatus.SKIPPED) {
-                        // 前驱非失败，不能跳过
-                        return false;
-                    }
-                }
-            }
-        }
-        return hasAnyPred;
-    }
-
-    /**
-     * 终态化 DagInstance（§22）。
-     */
-    private void tryFinalizeInstance(DagInstanceEntity instance, Instant now) {
-        NodeInstanceMapper.NodeStatusCount count = nodeInstanceMapper.countByStatus(instance.getId());
-        if (count == null || count.getActiveCount() == null || count.getActiveCount() > 0) {
-            return;  // 仍有非终态节点
-        }
-        DagInstanceStatus finalStatus = count.getFailedCount() > 0
-            ? DagInstanceStatus.FAILED : DagInstanceStatus.SUCCESS;
-        int updated = instanceMapper.finalizeInstance(
-            instance.getId(), finalStatus,
-            count.getSuccessCount() == null ? 0 : count.getSuccessCount(),
-            count.getFailedCount() == null ? 0 : count.getFailedCount(),
-            count.getSkippedCount() == null ? 0 : count.getSkippedCount(),
-            null, null, now);
-        if (updated > 0) {
-            log.info("DAG instance {} finalized as {}", instance.getId(), finalStatus);
         }
     }
 

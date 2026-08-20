@@ -98,7 +98,8 @@
     </update>
 
     <!-- 扫描 RUNNING(30) 且超时的 Attempt
-         超时条件：now - started_at > a.timeout_seconds（通过 JOIN algorithm_definition 获取超时配置） -->
+         超时条件：now - started_at > a.timeout_seconds（通过 JOIN algorithm_definition 获取超时配置）
+         对齐文档 §29.4：Scheduler 触发 TIMEOUT 检测 -->
     <select id="scanTimeoutAttempts" resultType="java.lang.Long">
         SELECT a.id
         FROM sr_dag_node_attempt a
@@ -127,5 +128,40 @@
         LIMIT #{batchSize}
         FOR UPDATE SKIP LOCKED
     </select>
+
+    <!-- 扫描 UNKNOWN(80) 且达到收敛窗口阈值的 Attempt（§19.1 / §29.5）
+         条件：now - finished_at > 2 * timeout_seconds（默认 600 秒）
+         对齐文档 §19.1：UNKNOWN 状态在 2×timeout_seconds 后未收到任何反馈，
+         则视为最终 TIMEOUT，避免永久卡住 -->
+    <select id="scanUnknownAttempts" resultType="java.lang.Long">
+        SELECT a.id
+        FROM sr_dag_node_attempt a
+        WHERE a.status = 80
+          AND a.finished_at IS NOT NULL
+          AND (NOW() - a.finished_at) > (
+              2 * COALESCE(
+                  (SELECT alg.timeout_seconds
+                   FROM sr_algorithm_definition alg
+                   WHERE alg.algorithm_code = a.algorithm_code),
+                  300
+              )
+          )
+        ORDER BY a.finished_at, a.id
+        LIMIT #{batchSize}
+        FOR UPDATE SKIP LOCKED
+    </select>
+
+    <!-- CAS: UNKNOWN(80) → TIMEOUT(70)（UNKNOWN 收敛，§19.1）
+         使 NodeAttemptSyncService 能将其作为 TIMEOUT 处理 -->
+    <update id="markUnknownAsTimeout">
+        UPDATE sr_dag_node_attempt
+        SET status = 70,
+            error_code = 'UNKNOWN_CONVERGE_TIMEOUT',
+            error_message = 'UNKNOWN state converged to TIMEOUT after 2x timeout window',
+            version = version + 1,
+            updated_at = #{now}
+        WHERE id = #{attemptId}
+          AND status = 80
+    </update>
 
 </mapper>

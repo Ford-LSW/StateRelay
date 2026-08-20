@@ -123,7 +123,7 @@ public class DagInstanceService {
         int started = instanceMapper.tryStartInstance(saved.getId(), now);
         if (started == 0) {
             throw new IllegalStateException("Failed to start DAG instance " + saved.getId()
-                + ": INIT → RUNNING CAS failed (concurrent start?)");
+                    + ": INIT → RUNNING CAS failed (concurrent start?)");
         }
         saved.setStatus(DagInstanceStatus.RUNNING);
         saved.setStartedAt(now);
@@ -145,21 +145,41 @@ public class DagInstanceService {
     }
 
     /**
-     * 取消 DAG 实例（对齐文档）：
+     * 取消 DAG 实例（对齐文档 §33.6 三方所有权划分）：
+     *
+     * <p>API 层职责（本方法）：
      * <ol>
-     *   <li>CAS DagInstance → CANCELLED(40)，lease_version+1</li>
-     *   <li>同事务把所有未终态节点 CAS 到 CANCELLED</li>
+     *   <li>启动取消事务：CAS RUNNING(10) → CANCELLING(15)，写 cancel_reason</li>
+     *   <li>同事务取消所有未开始节点（WAITING/READY/DISPATCHING → CANCELLED）</li>
+     *   <li>同事务把已取消的节点数累加到 finished_node_count</li>
      * </ol>
+     *
+     * <p>不在本方法做：
+     * <ul>
+     *   <li>RUNNING 节点的取消 —— 由 Scheduler 在 CANCELLING 状态扫描时调用 Worker cancel</li>
+     *   <li>DagInstance 终态化（CANCELLING → CANCELLED）—— 由 DAG Engine 在所有节点终态后推进</li>
+     * </ul>
+     *
+     * @param instanceId   DAG 实例主键
+     * @param cancelReason 取消原因（USER_CANCELLED / DAG_FAILED 等），写入 dag_instance.cancel_reason
+     * @return 1 表示本轮 CAS 成功（取消生效）；0 表示状态已非 RUNNING（已被其他流程推进）
      */
     @Transactional
-    public int cancelInstance(Long instanceId) {
+    public int cancelInstance(Long instanceId, String cancelReason) {
         Instant now = Instant.now();
-        int updated = instanceMapper.cancelInstance(instanceId, now);
-        if (updated > 0) {
-            // 取消成功，同时取消所有未终态节点
-            nodeInstanceMapper.cancelUnstartedNodes(instanceId, now);
-            nodeInstanceMapper.cancelRunningNodes(instanceId, now);
+        int updated = instanceMapper.startCancel(instanceId, cancelReason, now);
+        if (updated == 0) {
+            // 状态已非 RUNNING（可能已 CANCELLING / FAILING / 终态）；幂等返回 0，不重复处理
+            return 0;
         }
+        // 取消所有未开始节点（WAITING/READY/DISPATCHING → CANCELLED）
+        int cancelledCount = nodeInstanceMapper.cancelUnstartedNodes(instanceId, cancelReason, now);
+        if (cancelledCount > 0) {
+            // 同事务累加 finished_node_count（§39）
+            instanceMapper.incrementFinishedCount(instanceId, cancelledCount, now);
+        }
+        // RUNNING 节点保持原状态；由 Scheduler 在 CANCELLING 状态扫描时调用 Worker cancel
+        // DagInstance 终态化（CANCELLING → CANCELLED）由 DAG Engine 在所有节点终态后推进
         return updated;
     }
 

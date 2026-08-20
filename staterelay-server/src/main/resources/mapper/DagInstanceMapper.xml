@@ -33,19 +33,23 @@
           AND status = 0
     </update>
 
-    <!-- 扫描 RUNNING 实例（DAG Engine 轮询推进）
-         status: 10=RUNNING -->
-    <select id="scanRunningInstances" resultMap="DagInstanceLeaseMap">
+    <!-- 扫描活跃实例（RUNNING / CANCELLING / FAILING）
+         对齐文档 §25.1 / §35.1：scanner 需要扫这三种状态
+         status: 10=RUNNING, 15=CANCELLING, 18=FAILING -->
+    <select id="scanActiveInstances" resultMap="DagInstanceLeaseMap">
         SELECT id, worker_id, lease_version, lease_expire_time
         FROM sr_dag_instance
-        WHERE status = 10
+        WHERE status IN (10, 15, 18)
           AND (lease_expire_time IS NULL OR lease_expire_time &gt; #{now})
         ORDER BY last_progress_time, id
         LIMIT #{batchSize}
         FOR UPDATE SKIP LOCKED
     </select>
 
-    <!-- 终态化: CAS RUNNING(10) → SUCCESS(20)/FAILED(30)/CANCELLED(40) -->
+    <!-- 终态化: CAS 从中间态到终态
+         支持 RUNNING(10) → SUCCESS(20)
+                 FAILING(18) → FAILED(30)
+                 CANCELLING(15) → CANCELLED(40) -->
     <update id="finalizeInstance">
         UPDATE sr_dag_instance
         SET status = #{status.code},
@@ -57,19 +61,31 @@
             error_message = #{errorMessage},
             updated_at = #{now}
         WHERE id = #{dagInstanceId}
+          AND status = #{expectedFromStatus.code}
+    </update>
+
+    <!-- 启动取消事务：CAS RUNNING(10) → CANCELLING(15)（§33.6 步骤 1）
+         只允许 RUNNING → CANCELLING；若已 FAILING（节点失败先发生）则 CAS 失败 -->
+    <update id="startCancel">
+        UPDATE sr_dag_instance
+        SET status = 15,
+            cancel_reason = #{cancelReason},
+            lease_version = lease_version + 1,
+            last_progress_time = #{now},
+            updated_at = #{now}
+        WHERE id = #{dagInstanceId}
           AND status = 10
     </update>
 
-    <!-- 取消 DAG 实例：CAS → CANCELLED(40), lease_version+1
-         status: 0=INIT, 10=RUNNING -->
-    <update id="cancelInstance">
+    <!-- 启动失败清理：CAS RUNNING(10) → FAILING(18)（§31.1 / §39.1 T7）
+         只允许 RUNNING → FAILING；若已 CANCELLING（用户取消先发生）则 CAS 失败 -->
+    <update id="startFailing">
         UPDATE sr_dag_instance
-        SET status = 40,
-            lease_version = lease_version + 1,
-            next_schedule_time = #{now},
+        SET status = 18,
+            last_progress_time = #{now},
             updated_at = #{now}
         WHERE id = #{dagInstanceId}
-          AND status IN (0, 10)
+          AND status = 10
     </update>
 
     <!-- 更新心跳与租约 -->
@@ -82,6 +98,16 @@
         WHERE id = #{dagInstanceId}
           AND worker_id = #{workerId}
           AND lease_version = #{leaseVersion}
+    </update>
+
+    <!-- 同事务增加 finished_node_count（§39 / §39.1）
+         CAS 成功将 NodeInstance 推进到终态后，由调用方在同一事务内调用 -->
+    <update id="incrementFinishedCount">
+        UPDATE sr_dag_instance
+        SET finished_node_count = finished_node_count + #{delta},
+            last_progress_time = #{now},
+            updated_at = #{now}
+        WHERE id = #{dagInstanceId}
     </update>
 
 </mapper>

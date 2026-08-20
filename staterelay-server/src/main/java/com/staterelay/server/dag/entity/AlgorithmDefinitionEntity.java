@@ -18,6 +18,20 @@ import java.time.Instant;
  *
  * <p>表示系统具备的一种可调度能力。Scheduler 根据 {@code algorithmCode} 查到
  * {@code executorGroupCode}，再从 ExecutorRegistration 中选择存活 Worker。
+ *
+ * <p><b>不可修改约束（对齐文档 §10）：</b>
+ * 一旦 DagInstance 开始执行，本表行记录（包括 timeout_seconds / max_retry / retry_interval_seconds /
+ * executor_group_code / input_schema_json / output_schema_json）在本次执行期间<b>禁止修改</b>。
+ *
+ * <p>第一版通过操作纪律约束（运维/发布流程）：
+ * <ul>
+ *   <li>修改 AlgorithmDefinition 必须先停掉所有依赖此 algorithmCode 的 DagInstance</li>
+ *   <li>正式版本变更通过新建 AlgorithmDefinition 行 + 切换 algorithmCode 别名实现，避免原地修改</li>
+ *   <li>如果运维违反约束，NodeAttemptSyncService / DagNodeDispatchService 读取的字段值可能前后不一致，
+ *       导致 retry 计数错乱或超时窗口偏差，但不会破坏数据完整性</li>
+ * </ul>
+ *
+ * <p>第二版可引入 {@code version} 字段 + DagInstance 启动时 snapshot 冗余字段，从机制层面消除风险。
  */
 @Data
 @Entity

@@ -61,6 +61,25 @@ public class NodeInstanceEntity {
     @Column(name = "current_attempt_no", nullable = false)
     private Integer currentAttemptNo = 0;
 
+    /**
+     * Scheduler 已领取 Node 但因没有可用 Worker 而调度失败的次数（§9.1）。
+     * 与 {@link #retryCount} 含义严格分开：调度失败不创建 NodeAttempt，不增加 retry_count。
+     */
+    @Column(name = "schedule_fail_count", nullable = false)
+    private Integer scheduleFailCount = 0;
+
+    @Column(name = "last_schedule_error_code", length = 64)
+    private String lastScheduleErrorCode;
+
+    @Column(name = "last_schedule_error_message", length = 512)
+    private String lastScheduleErrorMessage;
+
+    /**
+     * 节点取消原因（USER_CANCELLED / DAG_FAILED / ...），仅在 CANCELLED 状态下有值。
+     */
+    @Column(name = "cancel_reason", length = 64)
+    private String cancelReason;
+
     @Column(name = "next_schedule_time")
     private Instant nextScheduleTime;
 

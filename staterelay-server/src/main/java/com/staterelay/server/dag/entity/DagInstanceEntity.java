@@ -16,7 +16,12 @@ import java.time.Instant;
 /**
  * DAG 实例（{@code sr_dag_instance}）。
  *
- * <p>状态机对齐文档：INIT → RUNNING → SUCCESS/FAILED/CANCELLED。
+ * <p>状态机对齐文档 §33.1 / §37.2：
+ * <pre>
+ * INIT → RUNNING → SUCCESS
+ * RUNNING → CANCELLING → CANCELLED
+ * RUNNING → FAILING → FAILED
+ * </pre>
  * 去掉了 orchestration_state 子状态机，由 status 唯一驱动。
  *
  * <p>简单查询走 JPA；租约抢占、CAS 推进走 MyBatis Mapper。
@@ -73,6 +78,14 @@ public class DagInstanceEntity {
     @Column(name = "total_node_count", nullable = false)
     private Integer totalNodeCount = 0;
 
+    /**
+     * 已完成节点数（任何终态都 +1）。
+     * <p>对齐文档 §39：NodeInstance 第一次进入终态时同事务 +1。
+     * 重试 / 无 Worker 未达上限的调度失败不触发 +1。
+     */
+    @Column(name = "finished_node_count", nullable = false)
+    private Integer finishedNodeCount = 0;
+
     @Column(name = "success_node_count", nullable = false)
     private Integer successNodeCount = 0;
 
@@ -81,6 +94,12 @@ public class DagInstanceEntity {
 
     @Column(name = "skipped_node_count", nullable = false)
     private Integer skippedNodeCount = 0;
+
+    /**
+     * 取消原因（USER_CANCELLED），仅在 CANCELLING / CANCELLED 状态下有值。
+     */
+    @Column(name = "cancel_reason", length = 64)
+    private String cancelReason;
 
     @Column(name = "next_schedule_time", nullable = false)
     private Instant nextScheduleTime;

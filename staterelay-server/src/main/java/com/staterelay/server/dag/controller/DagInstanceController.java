@@ -47,7 +47,8 @@ public class DagInstanceController {
     }
 
     @PostMapping("/{instanceId}/cancel")
-    public int cancel(@PathVariable Long instanceId) {
-        return instanceService.cancelInstance(instanceId);
+    public int cancel(@PathVariable Long instanceId,
+                      @RequestParam(required = false, defaultValue = "USER_CANCELLED") String cancelReason) {
+        return instanceService.cancelInstance(instanceId, cancelReason);
     }
 }
