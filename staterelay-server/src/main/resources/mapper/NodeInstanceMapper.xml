@@ -219,6 +219,36 @@
           AND status = 20
     </update>
 
+    <!-- CAS: RUNNING(40) → READY(10)（Worker 本地容量拒绝，§27.2）
+         对齐文档 §27.2：已创建 Attempt 并 DISPATCHING → RUNNING 之后 Worker 在进入 Handler 前返回 CAPACITY_REJECTED
+         schedule_fail_count = #{scheduleFailCount}（外部已自增）；不计 retry_count；不创建新 Attempt -->
+    <update id="revertToReadyForCapacityRejected">
+        UPDATE sr_dag_node_instance
+        SET status = 10,
+            schedule_fail_count = #{scheduleFailCount},
+            last_schedule_error_code = #{errorCode},
+            last_schedule_error_message = #{errorMessage},
+            dispatch_owner = NULL,
+            dispatch_lease_expire_time = NULL,
+            next_schedule_time = #{nextScheduleTime},
+            last_progress_time = #{now},
+            updated_at = #{now}
+        WHERE id = #{nodeInstanceId}
+          AND status = 40
+    </update>
+
+    <!-- 重置 schedule_fail_count = 0（§9.1 重置时机：heartbeat / 非容量拒绝结果 / TIMEOUT 收敛）
+         幂等：仅在 schedule_fail_count > 0 时更新 -->
+    <update id="resetScheduleFailCount">
+        UPDATE sr_dag_node_instance
+        SET schedule_fail_count = 0,
+            last_schedule_error_code = NULL,
+            last_schedule_error_message = NULL,
+            updated_at = #{now}
+        WHERE id = #{nodeInstanceId}
+          AND schedule_fail_count > 0
+    </update>
+
     <!-- 扫描 DISPATCHING 卡住节点（dispatch_lease_expire_time 过期） -->
     <select id="scanStuckDispatching" resultType="long">
         SELECT id

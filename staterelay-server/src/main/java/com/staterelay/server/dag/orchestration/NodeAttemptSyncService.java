@@ -140,6 +140,8 @@ public class NodeAttemptSyncService {
     /**
      * 处理 SUCCESS（§29.1）：CAS NodeInstance RUNNING → SUCCESS；
      * 同事务 +1 finished_node_count；写 Artifact 由业务层基于返回的快照补充。
+     *
+     * <p>同时重置 schedule_fail_count = 0（§9.1 重置时机之一：Worker 返回非容量拒绝 SUCCESS）。
      */
     private void applySuccess(NodeAttemptEntity attempt, NodeInstanceEntity node, Instant now) {
         NodeCompletionSnapshot snapshot = nodeInstanceMapper.markSuccess(
@@ -151,8 +153,9 @@ public class NodeAttemptSyncService {
             log.debug("NodeInstance {} already finalized or not RUNNING", node.getId());
             return;
         }
-        // 同事务 +1 finished_node_count（§39.1 T2）
+        // 同事务 +1 finished_node_count（§39.1 T2）+ 重置 schedule_fail_count（§9.1）
         dagInstanceMapper.incrementFinishedCount(node.getDagInstanceId(), 1, now);
+        nodeInstanceMapper.resetScheduleFailCount(node.getId(), now);
         log.debug("NodeInstance {} SUCCESS via attempt {}", node.getId(), attempt.getId());
     }
 
@@ -189,6 +192,8 @@ public class NodeAttemptSyncService {
             now);
         if (updated > 0) {
             dagInstanceMapper.incrementFinishedCount(node.getDagInstanceId(), 1, now);
+            // §9.1 重置时机：Worker 返回非容量拒绝 FAILED 结果（终态时重置）
+            nodeInstanceMapper.resetScheduleFailCount(node.getId(), now);
             log.info("NodeInstance {} FAILED (terminal, retry_count={}, max_retry={})",
                 node.getId(), node.getRetryCount(), maxRetry);
         }
@@ -234,6 +239,8 @@ public class NodeAttemptSyncService {
             now);
         if (updated > 0) {
             dagInstanceMapper.incrementFinishedCount(node.getDagInstanceId(), 1, now);
+            // §9.1 重置时机：非容量拒绝 Attempt 按 TIMEOUT 收敛（终态时重置）
+            nodeInstanceMapper.resetScheduleFailCount(node.getId(), now);
             log.info("NodeInstance {} TIMEOUT (terminal, retry_count={}, max_retry={})",
                 node.getId(), node.getRetryCount(), maxRetry);
         }

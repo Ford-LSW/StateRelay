@@ -23,6 +23,19 @@ import java.time.Instant;
  * <pre>
  * CREATED → DISPATCHING → ACCEPTED → RUNNING → SUCCESS/FAILED/CANCELLED/TIMEOUT/UNKNOWN
  * </pre>
+ *
+ * <p><b>lease 与硬截止时间分离（对齐文档 §43）：</b>
+ * <ul>
+ *   <li>{@link #attemptLeaseVersion}：lease 围栏版本号，单调递增；Scheduler CAS 升级后
+ *       通过 rebindFence 同步给 Worker Store；对齐 §19.1 / §44 / §47.1</li>
+ *   <li>{@link #attemptLeaseExpireTime}：Worker heartbeat 可续约的 lease 到期时间；
+ *       到期只触发 UNKNOWN / 接管恢复，不直接等于 TIMEOUT</li>
+ *   <li>{@link #executionDeadlineAt}：T8 创建 Attempt 时由数据库 NOW() + timeout_seconds
+ *       一次性固化的不可续约硬截止时间；heartbeat 不能延长；到期无论 lease 是否仍有效，
+ *       都进入 TIMEOUT 处理并 best-effort cancel；对齐 §29.4 / §29.5</li>
+ *   <li>{@link #workerEpoch}：Worker 重启周期；旧 epoch 的 heartbeat / 取消响应 / 执行结果
+ *       一律不能覆盖新 epoch 状态；对齐 §23</li>
+ * </ul>
  */
 @Data
 @Entity
@@ -53,6 +66,57 @@ public class NodeAttemptEntity {
 
     @Column(name = "worker_address", length = 512)
     private String workerAddress;
+
+    /**
+     * Worker 重启周期标识（对齐文档 §23）。
+     *
+     * <p>旧 epoch 的 heartbeat / 取消响应 / 执行结果一律不能覆盖新 epoch 状态。
+     * 跨 epoch 恢复时，Scheduler 必须先 CAS 重绑 worker_epoch + 升级 attempt_lease_version，
+     * 再通过 rebindFence 同步给 Worker Store（§19.1）。
+     */
+    @Column(name = "worker_epoch", length = 64)
+    private String workerEpoch;
+
+    /**
+     * Attempt lease 围栏版本号（对齐文档 §19.1 / §44 / §47.1）。
+     *
+     * <p>单调递增：仅当 {@code newLeaseVersion > storedLeaseVersion} 时允许 CAS 升级，
+     * 防止旧 Scheduler 在网络分区恢复后反向覆盖已升级的版本。
+     *
+     * <p>升级流程：
+     * <ol>
+     *   <li>Scheduler DB CAS：{@code attempt_lease_version} N→N+1</li>
+     *   <li>HTTP rebindFence 请求 Worker：校验 requestId / requestChecksum / attemptId /
+     *       workerId / workerEpoch 完整围栏 + 单调递增</li>
+     *   <li>Worker Store 原子升级内部 lease_version</li>
+     *   <li>后续 heartbeat / RUNNING / SUCCESS / FAILED 全部使用新 lease_version</li>
+     *   <li>升级前在途的旧版本响应一律按围栏不匹配拒绝（§47）</li>
+     * </ol>
+     */
+    @Column(name = "attempt_lease_version", nullable = false)
+    private Long attemptLeaseVersion = 0L;
+
+    /**
+     * Attempt lease 到期时间（对齐文档 §43）。
+     *
+     * <p>Worker heartbeat 可续约；续约时必须 {@code worker_id + worker_epoch +
+     * attempt_lease_version + current_attempt_id} 完整围栏匹配（§23）。
+     *
+     * <p>到期只触发 UNKNOWN / 接管恢复，不直接等于 TIMEOUT。
+     */
+    @Column(name = "attempt_lease_expire_time")
+    private Instant attemptLeaseExpireTime;
+
+    /**
+     * 执行硬截止时间（不可续约，对齐文档 §43 / §29.4 / §29.5）。
+     *
+     * <p>T8 创建 Attempt 时由数据库 {@code NOW() + timeout_seconds} 一次性固化。
+     * <p>heartbeat 不能延长；到期无论 lease 是否仍有效，都进入 TIMEOUT 处理并发起 best-effort cancel。
+     * <p>§29.4 超时判定：{@code DB_NOW >= execution_deadline_at}；扫描起点状态包含
+     * DISPATCHING / RUNNING / UNKNOWN。
+     */
+    @Column(name = "execution_deadline_at")
+    private Instant executionDeadlineAt;
 
     @Column(name = "status", nullable = false)
     @Convert(converter = NodeAttemptStatusConverter.class)

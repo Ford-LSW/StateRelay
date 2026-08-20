@@ -3,16 +3,21 @@
         "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
 <mapper namespace="com.staterelay.server.dag.mapper.NodeAttemptMapper">
 
-    <!-- 插入新的 NodeAttempt 记录
-         status: 0=CREATED -->
+    <!-- 插入新的 NodeAttempt 记录（T8 创建 Attempt 事务，对齐文档 §27 / §43）
+         - status: 0=CREATED
+         - attempt_lease_version: 1（首次创建）
+         - execution_deadline_at: NOW() + timeout_seconds（不可续约硬截止，由数据库时钟一次性固化）
+         - attempt_lease_expire_time: lease 到期时间（heartbeat 可续约） -->
     <insert id="insert">
         INSERT INTO sr_dag_node_attempt
             (dag_instance_id, node_instance_id, attempt_no, request_id,
-             algorithm_code, worker_id, worker_address, status, request_json,
+             algorithm_code, worker_id, worker_address, worker_epoch, status, request_json,
+             attempt_lease_version, attempt_lease_expire_time, execution_deadline_at,
              created_at, updated_at)
         VALUES
             (#{attempt.dagInstanceId}, #{attempt.nodeInstanceId}, #{attempt.attemptNo}, #{attempt.requestId},
-             #{attempt.algorithmCode}, #{attempt.workerId}, #{attempt.workerAddress}, 0, CAST(#{attempt.requestJson} AS JSONB),
+             #{attempt.algorithmCode}, #{attempt.workerId}, #{attempt.workerAddress}, #{attempt.workerEpoch}, 0, CAST(#{attempt.requestJson} AS JSONB),
+             #{attempt.attemptLeaseVersion}, #{attempt.attemptLeaseExpireTime}, #{attempt.executionDeadlineAt},
              #{now}, #{now})
     </insert>
 
@@ -97,20 +102,47 @@
           AND status IN (10, 20, 30)
     </update>
 
-    <!-- 扫描 RUNNING(30) 且超时的 Attempt
-         超时条件：now - started_at > a.timeout_seconds（通过 JOIN algorithm_definition 获取超时配置）
-         对齐文档 §29.4：Scheduler 触发 TIMEOUT 检测 -->
+    <!-- CAS: DISPATCHING(10) → UNKNOWN(80)（lease 到期，§29.5）
+         仅 lease 到期且硬截止未到期时调用，进入 §19.1 接管恢复 -->
+    <update id="markUnknownFromLeaseExpired">
+        UPDATE sr_dag_node_attempt
+        SET status = 80,
+            finished_at = COALESCE(finished_at, #{now}),
+            version = version + 1,
+            updated_at = #{now}
+        WHERE id = #{attemptId}
+          AND status = 10
+          AND execution_deadline_at IS NOT NULL
+          AND execution_deadline_at > #{now}
+    </update>
+
+    <!-- 扫描硬截止已到期的 Attempt（§29.4）
+         起点状态：DISPATCHING(10) / RUNNING(30) / UNKNOWN(80)
+         判定条件：NOW() >= execution_deadline_at（基于不可续约硬截止）
+         替代原基于 started_at 的超时检测 -->
     <select id="scanTimeoutAttempts" resultType="java.lang.Long">
         SELECT a.id
         FROM sr_dag_node_attempt a
-        WHERE a.status = 30
-          AND a.started_at IS NOT NULL
-          AND (NOW() - a.started_at) > (
-              SELECT COALESCE(alg.timeout_seconds, 300)
-              FROM sr_algorithm_definition alg
-              WHERE alg.algorithm_code = a.algorithm_code
-          )
-        ORDER BY a.started_at, a.id
+        WHERE a.status IN (10, 30, 80)
+          AND a.execution_deadline_at IS NOT NULL
+          AND a.execution_deadline_at &lt;= NOW()
+        ORDER BY a.execution_deadline_at, a.id
+        LIMIT #{batchSize}
+        FOR UPDATE SKIP LOCKED
+    </select>
+
+    <!-- 扫描 Attempt lease 到期但硬截止未到期的 Attempt（§29.5 / §43 / §19.1）
+         lease 到期 → 进入 UNKNOWN 接管恢复（rebindFence 重发原 requestId）
+         条件：attempt_lease_expire_time &lt; NOW() AND execution_deadline_at > NOW() -->
+    <select id="scanLeaseExpiredAttempts" resultType="java.lang.Long">
+        SELECT a.id
+        FROM sr_dag_node_attempt a
+        WHERE a.status IN (10, 30, 80)
+          AND a.attempt_lease_expire_time IS NOT NULL
+          AND a.attempt_lease_expire_time &lt; NOW()
+          AND a.execution_deadline_at IS NOT NULL
+          AND a.execution_deadline_at > NOW()
+        ORDER BY a.attempt_lease_expire_time, a.id
         LIMIT #{batchSize}
         FOR UPDATE SKIP LOCKED
     </select>
@@ -129,10 +161,9 @@
         FOR UPDATE SKIP LOCKED
     </select>
 
-    <!-- 扫描 UNKNOWN(80) 且达到收敛窗口阈值的 Attempt（§19.1 / §29.5）
-         条件：now - finished_at > 2 * timeout_seconds（默认 600 秒）
-         对齐文档 §19.1：UNKNOWN 状态在 2×timeout_seconds 后未收到任何反馈，
-         则视为最终 TIMEOUT，避免永久卡住 -->
+    <!-- 扫描 UNKNOWN(80) 且达到收敛窗口阈值的 Attempt（§19.1 / §29.5 兜底）
+         条件：now - finished_at > 2 * timeout_seconds
+         对齐文档 §19.1：UNKNOWN 状态在 2×timeout_seconds 后未收到任何反馈，则视为最终 TIMEOUT -->
     <select id="scanUnknownAttempts" resultType="java.lang.Long">
         SELECT a.id
         FROM sr_dag_node_attempt a
@@ -162,6 +193,46 @@
             updated_at = #{now}
         WHERE id = #{attemptId}
           AND status = 80
+    </update>
+
+    <!-- T8A：Worker heartbeat 续约 Attempt lease（对齐文档 §23 / §27 / §43）
+         完整围栏校验：attempt_id + attempt_lease_version + worker_id + worker_epoch 全部匹配
+         仅续约 attempt_lease_expire_time；显式不修改 execution_deadline_at
+         同步模式：DISPATCHING(10) / UNKNOWN(80) 顺带推进到 RUNNING(30)，首次写 started_at
+         同时把 NodeInstance.schedule_fail_count 重置为 0（§9.1 重置时机） -->
+    <update id="renewLease">
+        UPDATE sr_dag_node_attempt
+        SET attempt_lease_expire_time = #{newLeaseExpireTime},
+            status = CASE
+                WHEN status IN (10, 80) THEN 30
+                ELSE status
+            END,
+            started_at = COALESCE(started_at, #{now}),
+            version = version + 1,
+            updated_at = #{now}
+        WHERE id = #{attemptId}
+          AND attempt_lease_version = #{leaseVersion}
+          AND worker_id = #{workerId}
+          AND worker_epoch = #{workerEpoch}
+          AND status IN (10, 30, 80)
+    </update>
+
+    <!-- CAS 升级 Attempt lease_version（§19.1 / §44 / §47.1 rebindFence 协议）
+         前置条件（fail-closed）：
+           - newLeaseVersion > currentLeaseVersion（严格单调递增）
+           - attemptId 匹配
+           - 状态 ∈ {DISPATCHING(10), RUNNING(30), UNKNOWN(80)}（终态不允许升级）
+         重绑 worker_epoch + 重置 attempt_lease_expire_time -->
+    <update id="incrementLeaseVersion">
+        UPDATE sr_dag_node_attempt
+        SET attempt_lease_version = #{newLeaseVersion},
+            worker_epoch = #{newWorkerEpoch},
+            attempt_lease_expire_time = #{newLeaseExpireTime},
+            version = version + 1,
+            updated_at = #{now}
+        WHERE id = #{attemptId}
+          AND attempt_lease_version = #{currentLeaseVersion}
+          AND status IN (10, 30, 80)
     </update>
 
 </mapper>

@@ -169,6 +169,40 @@ public interface NodeInstanceMapper {
                                  @Param("now") Instant now);
 
     /**
+     * CAS: RUNNING(40) → READY(10)（Worker 本地容量拒绝，§27.2）。
+     *
+     * <p>对齐文档 §27.2：已创建 Attempt 并 DISPATCHING → RUNNING 之后，
+     * Worker 在进入 Handler 前返回 CAPACITY_REJECTED。
+     * 与无 Worker 区分：Attempt FAILED + 走 T6C 而非 T3 重试；
+     * schedule_fail_count 自增、不计 retry_count、不创建新 Attempt。
+     *
+     * <p>同步模式 Attempt 已是 RUNNING(30)，这里只回退 NodeInstance 维度。
+     *
+     * @return 受影响行数
+     */
+    int revertToReadyForCapacityRejected(@Param("nodeInstanceId") Long nodeInstanceId,
+                                          @Param("scheduleFailCount") int scheduleFailCount,
+                                          @Param("nextScheduleTime") Instant nextScheduleTime,
+                                          @Param("errorCode") String errorCode,
+                                          @Param("errorMessage") String errorMessage,
+                                          @Param("now") Instant now);
+
+    /**
+     * 重置 schedule_fail_count = 0（§9.1 重置时机）。
+     *
+     * <p>触发时机：
+     * <ul>
+     *   <li>heartbeat 证明 Handler 已运行（T8A 同事务调用）</li>
+     *   <li>Worker 返回非容量拒绝的 SUCCESS / FAILED 结果</li>
+     *   <li>非容量拒绝 Attempt 按 TIMEOUT 收敛</li>
+     * </ul>
+     *
+     * <p>幂等：CAS 仅在 schedule_fail_count > 0 时更新。
+     */
+    int resetScheduleFailCount(@Param("nodeInstanceId") Long nodeInstanceId,
+                                @Param("now") Instant now);
+
+    /**
      * 扫描 DISPATCHING 卡住节点（dispatch_lease_expire_time 过期），回退到 READY。
      */
     List<Long> scanStuckDispatching(@Param("now") Instant now, @Param("batchSize") int batchSize);

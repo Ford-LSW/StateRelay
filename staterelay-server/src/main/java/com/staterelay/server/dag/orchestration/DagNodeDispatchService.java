@@ -63,6 +63,7 @@ public class DagNodeDispatchService {
     private final TransactionTemplate transactions;
     private final int maxScheduleFailCount;
     private final int noWorkerRetryIntervalSeconds;
+    private final int workerLeaseSeconds;
 
     public DagNodeDispatchService(NodeInstanceMapper nodeInstanceMapper,
                                    NodeInstanceJpaRepository nodeInstanceRepository,
@@ -74,7 +75,8 @@ public class DagNodeDispatchService {
                                    ParameterResolver parameterResolver,
                                    TransactionTemplate transactions,
                                    @Value("${staterelay.dag.scheduler.max-schedule-fail-count:10}") int maxScheduleFailCount,
-                                   @Value("${staterelay.dag.scheduler.no-worker-retry-interval-seconds:5}") int noWorkerRetryIntervalSeconds) {
+                                   @Value("${staterelay.dag.scheduler.no-worker-retry-interval-seconds:5}") int noWorkerRetryIntervalSeconds,
+                                   @Value("${staterelay.dag.scheduler.worker-lease-seconds:30}") int workerLeaseSeconds) {
         this.nodeInstanceMapper = nodeInstanceMapper;
         this.nodeInstanceRepository = nodeInstanceRepository;
         this.dagInstanceMapper = dagInstanceMapper;
@@ -86,6 +88,7 @@ public class DagNodeDispatchService {
         this.transactions = transactions;
         this.maxScheduleFailCount = maxScheduleFailCount;
         this.noWorkerRetryIntervalSeconds = noWorkerRetryIntervalSeconds;
+        this.workerLeaseSeconds = workerLeaseSeconds;
     }
 
     /**
@@ -219,15 +222,30 @@ public class DagNodeDispatchService {
     }
 
     /**
-     * 有 Worker：创建 NodeAttempt + CAS DISPATCHING → RUNNING（同步模式，T5）。
+     * 有 Worker：创建 NodeAttempt + CAS DISPATCHING → RUNNING（同步模式，T5/T8）。
+     *
+     * <p>对齐文档 §27 / §43：
+     * <ul>
+     *   <li>固定 requestId（后续重发 / rebindFence 复用）</li>
+     *   <li>attempt_lease_version = 1（首次创建）</li>
+     *   <li>attempt_lease_expire_time = now + workerLeaseSeconds（heartbeat 可续约）</li>
+     *   <li>execution_deadline_at = now + timeout_seconds（不可续约硬截止，T8 创建时一次性固化）</li>
+     *   <li>worker_epoch 取自 ExecutorRegistration（旧 epoch 一律不能覆盖）</li>
+     * </ul>
      *
      * <p>第一版 NodeAttempt 在同步模式下直接进入 RUNNING，跳过 DISPATCHING/ACCEPTED 中间状态。
-     * HTTP 调用由后续 Worker 状态回报模块处理。
+     * HTTP 调用由后续 Worker 状态回报模块处理；容量拒绝回报走 T6C 事务（§27.2）。
      */
     private void executeWithWorker(NodeInstanceEntity node, AlgorithmDefinitionEntity algo,
                                    ExecutorRegistrationEntity worker, String requestJson, Instant now) {
         Integer currentAttemptNo = (node.getCurrentAttemptNo() == null ? 0 : node.getCurrentAttemptNo()) + 1;
         String requestId = UUID.randomUUID().toString();
+
+        // T8：固定 requestId + lease 围栏 + 不可续约硬截止（§27 / §43）
+        Long attemptLeaseVersion = 1L;
+        Instant attemptLeaseExpireTime = now.plus(Duration.ofSeconds(workerLeaseSeconds));
+        Integer timeoutSeconds = algo.getTimeoutSeconds() != null ? algo.getTimeoutSeconds() : 300;
+        Instant executionDeadlineAt = now.plus(Duration.ofSeconds(timeoutSeconds));
 
         NodeAttemptMapper.NodeAttemptInsert attemptInsert = new NodeAttemptMapper.NodeAttemptInsert(
             node.getDagInstanceId(),
@@ -237,7 +255,11 @@ public class DagNodeDispatchService {
             algo.getAlgorithmCode(),
             worker.getWorkerId(),
             worker.getAddress(),
-            requestJson);
+            worker.getWorkerEpoch(),
+            requestJson,
+            attemptLeaseVersion,
+            attemptLeaseExpireTime,
+            executionDeadlineAt);
         nodeAttemptMapper.insert(attemptInsert, now);
 
         // CAS NodeInstance DISPATCHING → RUNNING（同步模式跳过 DISPATCHED，§11）
@@ -247,8 +269,9 @@ public class DagNodeDispatchService {
                 node.getId());
             return;
         }
-        log.info("NodeInstance {} dispatched to worker {} (attemptNo={}, algorithm={})",
-            node.getId(), worker.getWorkerId(), currentAttemptNo, algo.getAlgorithmCode());
+        log.info("NodeInstance {} dispatched to worker {} (attemptNo={}, algorithm={}, leaseVersion={}, deadline={})",
+            node.getId(), worker.getWorkerId(), currentAttemptNo, algo.getAlgorithmCode(),
+            attemptLeaseVersion, executionDeadlineAt);
     }
 
     /**
