@@ -10,12 +10,12 @@
          - attempt_lease_expire_time: lease 到期时间（heartbeat 可续约） -->
     <insert id="insert">
         INSERT INTO sr_dag_node_attempt
-            (dag_instance_id, node_instance_id, attempt_no, request_id,
+            (dag_instance_id, node_instance_id, attempt_no, request_id, request_checksum,
              algorithm_code, worker_id, worker_address, worker_epoch, status, request_json,
              attempt_lease_version, attempt_lease_expire_time, execution_deadline_at,
              created_at, updated_at)
         VALUES
-            (#{attempt.dagInstanceId}, #{attempt.nodeInstanceId}, #{attempt.attemptNo}, #{attempt.requestId},
+            (#{attempt.dagInstanceId}, #{attempt.nodeInstanceId}, #{attempt.attemptNo}, #{attempt.requestId}, #{attempt.requestChecksum},
              #{attempt.algorithmCode}, #{attempt.workerId}, #{attempt.workerAddress}, #{attempt.workerEpoch}, 0, CAST(#{attempt.requestJson} AS JSONB),
              #{attempt.attemptLeaseVersion}, #{attempt.attemptLeaseExpireTime}, #{attempt.executionDeadlineAt},
              #{now}, #{now})
@@ -67,6 +67,21 @@
           AND status = 30
     </update>
 
+    <!-- CAS: DISPATCHING(10) / RUNNING(30) / UNKNOWN(80) → SUCCESS(40)，
+         带 lease_version 围栏校验（§19.1 / §47.1 lease 接管恢复回写） -->
+    <update id="markSuccessFromRecovery">
+        UPDATE sr_dag_node_attempt
+        SET status = 40,
+            result_json = CAST(#{resultJson} AS JSONB),
+            result_ref = #{resultRef},
+            finished_at = #{now},
+            version = version + 1,
+            updated_at = #{now}
+        WHERE id = #{attemptId}
+          AND status IN (10, 30, 80)
+          AND attempt_lease_version = #{leaseVersion}
+    </update>
+
     <!-- CAS: RUNNING(30) → FAILED(50) -->
     <update id="markFailed">
         UPDATE sr_dag_node_attempt
@@ -78,6 +93,21 @@
             updated_at = #{now}
         WHERE id = #{attemptId}
           AND status = 30
+    </update>
+
+    <!-- CAS: DISPATCHING(10) / RUNNING(30) / UNKNOWN(80) → FAILED(50)，
+         带 lease_version 围栏校验（§19.1 / §47.1 lease 接管恢复回写） -->
+    <update id="markFailedFromRecovery">
+        UPDATE sr_dag_node_attempt
+        SET status = 50,
+            error_code = #{errorCode},
+            error_message = #{errorMessage},
+            finished_at = #{now},
+            version = version + 1,
+            updated_at = #{now}
+        WHERE id = #{attemptId}
+          AND status IN (10, 30, 80)
+          AND attempt_lease_version = #{leaseVersion}
     </update>
 
     <!-- CAS: RUNNING(30) → TIMEOUT(70) -->

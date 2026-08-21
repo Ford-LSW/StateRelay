@@ -252,10 +252,11 @@ public class DagNodeDispatchService {
             node.getId(),
             currentAttemptNo,
             requestId,
+            computeRequestChecksum(algo.getAlgorithmCode(), requestJson),
             algo.getAlgorithmCode(),
             worker.getWorkerId(),
             worker.getAddress(),
-            worker.getWorkerEpoch(),
+            null,  // worker_epoch：T8 创建时尚无 epoch；由 rebindFence 接管恢复时重绑（§19.1 / §43）
             requestJson,
             attemptLeaseVersion,
             attemptLeaseExpireTime,
@@ -288,5 +289,29 @@ public class DagNodeDispatchService {
             .filter(w -> w.getMaxConcurrency() != null && w.getMaxConcurrency() > 0)
             .findFirst()
             .orElse(null);
+    }
+
+    /**
+     * 计算业务参数摘要（§44 rebindFence 围栏校验字段）。
+     *
+     * <p>checksum = SHA-256(algorithmCode + ":" + requestJson)
+     * <p>相同 requestId + 不同 checksum 必须 fail-closed 拒绝（防止业务参数变化后旧 requestId 误覆盖）。
+     */
+    private static String computeRequestChecksum(String algorithmCode, String requestJson) {
+        String input = (algorithmCode == null ? "" : algorithmCode)
+                + ":"
+                + (requestJson == null ? "" : requestJson);
+        try {
+            java.security.MessageDigest md = java.security.MessageDigest.getInstance("SHA-256");
+            byte[] digest = md.digest(input.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            StringBuilder sb = new StringBuilder(digest.length * 2);
+            for (byte b : digest) {
+                sb.append(String.format("%02x", b));
+            }
+            return sb.toString();
+        } catch (java.security.NoSuchAlgorithmException ex) {
+            // SHA-256 是 JDK 标准算法，理论不会缺失；若发生则用 fallback
+            return Integer.toHexString(input.hashCode());
+        }
     }
 }

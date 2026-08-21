@@ -1,5 +1,7 @@
 package com.staterelay.starter;
 
+import com.staterelay.starter.execution.InMemoryRequestIdStore;
+import com.staterelay.starter.execution.RequestIdStore;
 import com.staterelay.starter.handler.HandlerRegistry;
 import com.staterelay.starter.registration.WorkerIdentityProvider;
 import com.staterelay.starter.registration.WorkerRegistrationClient;
@@ -21,6 +23,18 @@ public class StateRelayAutoConfiguration {
     @ConditionalOnMissingBean
     HandlerRegistry stateRelayHandlerRegistry(ListableBeanFactory beanFactory) {
         return new HandlerRegistry(beanFactory);
+    }
+
+    /**
+     * Worker 端 requestId 去重存储 SPI（对齐文档 §44）。
+     *
+     * <p>默认提供 {@link InMemoryRequestIdStore}（PROCESS_LOCAL 策略），
+     * 业务可自定义 DURABLE 实现（JDBC/Redis/本地文件等）覆盖此 Bean。
+     */
+    @Bean
+    @ConditionalOnMissingBean
+    RequestIdStore stateRelayRequestIdStore() {
+        return new InMemoryRequestIdStore();
     }
 
     @Bean

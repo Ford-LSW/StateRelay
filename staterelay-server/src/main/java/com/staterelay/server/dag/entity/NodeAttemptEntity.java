@@ -58,6 +58,17 @@ public class NodeAttemptEntity {
     @Column(name = "request_id", nullable = false, length = 128)
     private String requestId;
 
+    /**
+     * 业务参数摘要（对齐文档 §44 / §47.1 rebindFence 围栏校验）。
+     *
+     * <p>algorithmCode + requestJson 的 SHA-256 摘要。
+     * <p>lease 接管恢复时，Server 调用 Worker rebindFence 必须携带本字段；
+     * Worker Store 校验"相同 requestId + 相同 checksum"才允许升级 lease_version，
+     * 防止业务参数变化后旧 requestId 误覆盖新结果。
+     */
+    @Column(name = "request_checksum", nullable = false, length = 64)
+    private String requestChecksum = "";
+
     @Column(name = "algorithm_code", nullable = false, length = 128)
     private String algorithmCode;
 

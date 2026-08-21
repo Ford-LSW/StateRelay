@@ -38,10 +38,13 @@ public class NodeInstanceService {
     /**
      * 重试失败节点：CAS 当前状态 → READY，retry_count + 1，attempt_no + 1。
      * 对齐文档 §20.1：重试由 Scheduler 触发（持有 max_retry 配置）。
+     *
+     * <p>retry_count / current_attempt_no 由 SQL 自增（避免并发丢失更新），
+     * 无需 Java 传值。
      */
     @Transactional
-    public int retryNode(Long nodeInstanceId, int retryCount, int currentAttemptNo) {
-        return mapper.revertToReady(nodeInstanceId, retryCount, currentAttemptNo,
-            Instant.now().plusSeconds(1), Instant.now());
+    public int retryNode(Long nodeInstanceId) {
+        Instant now = Instant.now();
+        return mapper.revertToReady(nodeInstanceId, now.plusSeconds(1), now);
     }
 }

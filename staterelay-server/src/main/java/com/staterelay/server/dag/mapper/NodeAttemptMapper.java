@@ -49,12 +49,40 @@ public interface NodeAttemptMapper {
                     @Param("now") Instant now);
 
     /**
+     * CAS: DISPATCHING(10) / RUNNING(30) / UNKNOWN(80) → SUCCESS(40)，
+     * 带 lease_version 围栏校验（对齐文档 §19.1 / §47.1）。
+     *
+     * <p>由 {@link com.staterelay.server.dag.orchestration.NodeAttemptLeaseRecoverScanner}
+     * 在 lease 接管恢复收到 Worker SUCCESS 响应时调用。
+     *
+     * <p>围栏条件：{@code attempt_lease_version = #{leaseVersion}}（防旧版本反向覆盖）。
+     */
+    int markSuccessFromRecovery(@Param("attemptId") Long attemptId,
+                                @Param("leaseVersion") Long leaseVersion,
+                                @Param("resultJson") String resultJson,
+                                @Param("resultRef") String resultRef,
+                                @Param("now") Instant now);
+
+    /**
      * CAS: RUNNING(30) → FAILED(50)。
      */
     int markFailed(@Param("attemptId") Long attemptId,
                    @Param("errorCode") String errorCode,
                    @Param("errorMessage") String errorMessage,
                    @Param("now") Instant now);
+
+    /**
+     * CAS: DISPATCHING(10) / RUNNING(30) / UNKNOWN(80) → FAILED(50)，
+     * 带 lease_version 围栏校验（对齐文档 §19.1 / §47.1）。
+     *
+     * <p>由 {@link com.staterelay.server.dag.orchestration.NodeAttemptLeaseRecoverScanner}
+     * 在 lease 接管恢复收到 Worker FAILED 响应时调用。
+     */
+    int markFailedFromRecovery(@Param("attemptId") Long attemptId,
+                               @Param("leaseVersion") Long leaseVersion,
+                               @Param("errorCode") String errorCode,
+                               @Param("errorMessage") String errorMessage,
+                               @Param("now") Instant now);
 
     /**
      * CAS: RUNNING(30) → TIMEOUT(70)（Scheduler 超时扫描）。
@@ -175,6 +203,7 @@ public interface NodeAttemptMapper {
         private Long nodeInstanceId;
         private Integer attemptNo;
         private String requestId;
+        private String requestChecksum;
         private String algorithmCode;
         private String workerId;
         private String workerAddress;

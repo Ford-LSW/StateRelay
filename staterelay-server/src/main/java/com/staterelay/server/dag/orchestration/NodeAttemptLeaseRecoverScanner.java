@@ -2,6 +2,9 @@ package com.staterelay.server.dag.orchestration;
 
 import com.staterelay.contract.dag.enums.NodeAttemptStatus;
 import com.staterelay.contract.dag.enums.NodeInstanceStatus;
+import com.staterelay.contract.protocol.RebindFenceRequest;
+import com.staterelay.contract.protocol.RebindFenceResponse;
+import com.staterelay.contract.protocol.RequestStatusResponse;
 import com.staterelay.server.dag.entity.AlgorithmDefinitionEntity;
 import com.staterelay.server.dag.entity.NodeAttemptEntity;
 import com.staterelay.server.dag.entity.NodeInstanceEntity;
@@ -10,6 +13,8 @@ import com.staterelay.server.dag.mapper.NodeInstanceMapper;
 import com.staterelay.server.dag.repository.AlgorithmDefinitionRepository;
 import com.staterelay.server.dag.repository.NodeAttemptRepository;
 import com.staterelay.server.dag.repository.NodeInstanceJpaRepository;
+import com.staterelay.server.dag.worker.WorkerHttpClient;
+import com.staterelay.server.dag.worker.WorkerHttpException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
@@ -31,12 +36,12 @@ import java.util.List;
  *
  * <p>对每个命中 Attempt 执行 §19.1 接管恢复流程：
  * <ol>
- *   <li>DAG Engine CAS NodeInstance RUNNING → UNKNOWN（§29.5：lease 到期触发 UNKNOWN）</li>
  *   <li>Scheduler DB CAS 升级 attempt_lease_version N→N+1（§19.1 / §47.1）</li>
  *   <li>HTTP rebindFence 请求 Worker：校验 requestId / requestChecksum / attemptId /
  *       workerId / workerEpoch 完整围栏 + 单调递增；Worker Store 原子升级内部 lease_version</li>
- *   <li>使用新 lease_version 重发原 requestId（依赖 Worker 去重 Store 返回 RUNNING/SUCCESS/FAILED）</li>
- *   <li>结果按 §47 围栏回写</li>
+ *   <li>HTTP 查询 requestId 当前状态（"使用原 requestId 重发"语义，§19.1）</li>
+ *   <li>根据 Worker 响应按 §47 围栏回写 NodeAttempt（{@link NodeAttemptMapper#markSuccessFromRecovery}
+ *       / {@link NodeAttemptMapper#markFailedFromRecovery} CAS）</li>
  * </ol>
  *
  * <p>跨 epoch 恢复分支（§19.1）：
@@ -48,8 +53,8 @@ import java.util.List;
  *   <li>跨 worker_id 恢复：第一版禁止；等硬截止到期收敛为 TIMEOUT</li>
  * </ul>
  *
- * <p>第一版不实现 Worker HTTP 调用：本 Scanner 只完成 DB CAS 升级 + UNKNOWN 推进，
- * rebindFence HTTP 调用由后续 Worker RPC 模块补充（接口已就绪：{@link NodeAttemptMapper#incrementLeaseVersion}）。
+ * <p>HTTP 失败 fail-closed：网络错误 / 超时 / Worker 5xx 一律抛 {@link WorkerHttpException}，
+ * Scanner 捕获后等下一轮重试或硬截止到期收敛为 TIMEOUT（§29.4）。
  */
 @Service
 public class NodeAttemptLeaseRecoverScanner {
@@ -61,6 +66,7 @@ public class NodeAttemptLeaseRecoverScanner {
     private final NodeAttemptRepository attemptRepository;
     private final NodeInstanceJpaRepository nodeInstanceRepository;
     private final AlgorithmDefinitionRepository algorithmDefinitionRepository;
+    private final WorkerHttpClient workerHttpClient;
     private final int batchSize;
     private final int workerLeaseSeconds;
 
@@ -69,6 +75,7 @@ public class NodeAttemptLeaseRecoverScanner {
                                            NodeAttemptRepository attemptRepository,
                                            NodeInstanceJpaRepository nodeInstanceRepository,
                                            AlgorithmDefinitionRepository algorithmDefinitionRepository,
+                                           WorkerHttpClient workerHttpClient,
                                            @Value("${staterelay.dag.lease-recover.batch-size:50}") int batchSize,
                                            @Value("${staterelay.dag.scheduler.worker-lease-seconds:30}") int workerLeaseSeconds) {
         this.attemptMapper = attemptMapper;
@@ -76,6 +83,7 @@ public class NodeAttemptLeaseRecoverScanner {
         this.attemptRepository = attemptRepository;
         this.nodeInstanceRepository = nodeInstanceRepository;
         this.algorithmDefinitionRepository = algorithmDefinitionRepository;
+        this.workerHttpClient = workerHttpClient;
         this.batchSize = batchSize;
         this.workerLeaseSeconds = workerLeaseSeconds;
     }
@@ -106,9 +114,6 @@ public class NodeAttemptLeaseRecoverScanner {
 
     /**
      * 执行 §19.1 接管恢复流程（单 Attempt）。
-     *
-     * <p>第一版仅完成 DB 层 CAS 升级 + UNKNOWN 推进；
-     * rebindFence HTTP 调用由后续 Worker RPC 模块补充。
      */
     public void recoverOne(Long attemptId, Instant now) {
         NodeAttemptEntity attempt = attemptRepository.findById(attemptId).orElse(null);
@@ -161,40 +166,58 @@ public class NodeAttemptLeaseRecoverScanner {
     /**
      * §19.1 恢复路径判定。
      *
-     * <p>第一版简化：仅基于 worker_epoch 是否仍然存活判定。
-     * 实际需要查 ExecutorRegistration 判断 worker_epoch 是否仍在线（第一版预留，由后续实现补完）。
+     * <p>第一版简化：所有 lease 到期都走 RebindFenceNewEpoch 路径
+     * （兼容同 epoch 和跨 epoch 场景；Worker Store 不在线时 HTTP 失败由 fail-closed 兜底）。
+     * 实际生产应查 ExecutorRegistration 判断原 epoch 是否仍存活：
+     * <ul>
+     *   <li>原 epoch 在线 → RESendOriginalEpoch（直接重发，不升级 lease_version）</li>
+     *   <li>DURABLE + 同 worker_id 新 epoch → RebindFenceNewEpoch（CAS 升级 + rebindFence + 重发）</li>
+     *   <li>PROCESS_LOCAL + 原 epoch 失效 → WaitForHardDeadline</li>
+     * </ul>
      */
     private RecoveryPath decideRecoveryPath(NodeAttemptEntity attempt) {
-        // 第一版简化：所有 lease 到期都走 RebindFenceNewEpoch 路径
-        // 实际应根据 ExecutorRegistration 判断原 epoch 是否仍存活
-        // - 原 epoch 在线 → RESendOriginalRequestId
-        // - DURABLE + 同 worker_id 新 epoch → RebindFenceNewEpoch
-        // - PROCESS_LOCAL + 原 epoch 失效 → WaitForHardDeadline
         return RecoveryPath.RebindFenceNewEpoch;
     }
 
     /**
      * §19.1 分支 A：原 epoch 仍存活，直接重发原 requestId（不升级 lease_version）。
      *
-     * <p>第一版不实现 HTTP 调用，仅记录意图。
+     * <p>实现：HTTP 调用 Worker /status 端点查询 requestId 当前状态（§19.1 "重发原 requestId"语义）。
+     * 根据 Worker 端响应：
+     * <ul>
+     *   <li>present=true + state=RUNNING：Worker 仍在执行，等下一轮或硬截止</li>
+     *   <li>present=true + state=SUCCESS：按 §47 围栏回写 NodeAttempt SUCCESS</li>
+     *   <li>present=true + state=FAILED：按 §47 围栏回写 NodeAttempt FAILED</li>
+     *   <li>present=false：Worker 端记录丢失（PROCESS_LOCAL + Pod 重启），等硬截止收敛</li>
+     * </ul>
      */
     private void resendOriginalRequestId(NodeAttemptEntity attempt, Instant now) {
         log.info("NodeAttempt {} recovery: resend original requestId {} (same epoch)",
             attempt.getId(), attempt.getRequestId());
-        // TODO: 后续 Worker RPC 模块实现：HTTP 重发原 requestId
+
+        RequestStatusResponse status;
+        try {
+            status = workerHttpClient.findRequestStatus(
+                attempt.getWorkerAddress(), attempt.getRequestId());
+        } catch (WorkerHttpException ex) {
+            log.warn("NodeAttempt {} resendOriginalRequestId HTTP failed: {}",
+                attempt.getId(), ex.getMessage());
+            return;  // 下一轮重试
+        }
+
+        applyWorkerStatusToAttempt(attempt, status, attempt.getAttemptLeaseVersion(), now);
     }
 
     /**
-     * §19.1 分支 B：DURABLE + 同 worker_id 新 epoch，CAS 升级 lease_version + rebindFence。
+     * §19.1 分支 B：DURABLE + 同 worker_id 新 epoch，CAS 升级 lease_version + rebindFence + 重发。
      *
      * <p>对齐文档 §19.1 / §44 / §47.1：
      * <ol>
      *   <li>DB CAS 升级 attempt_lease_version N→N+1（{@link NodeAttemptMapper#incrementLeaseVersion}）</li>
-     *   <li>HTTP rebindFence 请求 Worker Store 升级内部 lease_version</li>
-     *   <li>使用新 lease_version 重发原 requestId</li>
+     *   <li>HTTP rebindFence 请求 Worker Store 升级内部 lease_version（§44.2 单调递增 + 完整围栏校验）</li>
+     *   <li>HTTP 查询 requestId 状态（"使用新 lease_version 重发原 requestId"语义）</li>
+     *   <li>根据 Worker 响应按 §47 围栏回写 NodeAttempt（CAS 带 lease_version 围栏）</li>
      * </ol>
-     *
-     * <p>第一版仅完成 DB CAS 升级；rebindFence HTTP 调用由后续 Worker RPC 模块实现。
      */
     private void upgradeLeaseVersionAndRebind(NodeAttemptEntity attempt, Instant now) {
         Long currentLeaseVersion = attempt.getAttemptLeaseVersion();
@@ -224,17 +247,109 @@ public class NodeAttemptLeaseRecoverScanner {
             return;
         }
 
-        log.info("NodeAttempt {} lease_version upgraded {} → {} (rebindFence pending HTTP call)",
+        log.info("NodeAttempt {} lease_version upgraded {} → {} (proceeding to rebindFence HTTP)",
             attempt.getId(), currentLeaseVersion, newLeaseVersion);
 
-        // 2. TODO：HTTP rebindFence 请求 Worker Store 升级内部 lease_version
-        //    调用方应使用 attempt.getRequestId() + RequestFence(attempt.getId(), workerId, newWorkerEpoch, newLeaseVersion)
-        //    校验 requestId / requestChecksum / attemptId / workerId / workerEpoch 完整围栏 + 单调递增
-        //    Worker Store 原子升级内部 lease_version
+        // 2. HTTP rebindFence 请求 Worker Store 升级内部 lease_version（§44.2）
+        RebindFenceRequest rebindRequest = new RebindFenceRequest(
+            attempt.getRequestId(),
+            attempt.getRequestChecksum(),
+            attempt.getId(),
+            attempt.getWorkerId(),
+            newWorkerEpoch,
+            newLeaseVersion);
 
-        // 3. TODO：使用新 lease_version 重发原 requestId
-        //    Worker 去重 Store 返回 RUNNING/SUCCESS/FAILED（已升级到新 lease_version）
-        //    结果按 §47 围栏回写
+        try {
+            RebindFenceResponse response = workerHttpClient.rebindFence(
+                attempt.getWorkerAddress(), rebindRequest);
+            if (!response.success()) {
+                log.warn("NodeAttempt {} rebindFence rejected by Worker: {}; wait for hard deadline",
+                    attempt.getId(), response.reason());
+                return;  // 等硬截止收敛
+            }
+            log.info("NodeAttempt {} rebindFence success: Worker Store upgraded to leaseVersion={}",
+                attempt.getId(), newLeaseVersion);
+        } catch (WorkerHttpException ex) {
+            log.warn("NodeAttempt {} rebindFence HTTP failed: {}; DB lease_version upgraded but Worker Store stale",
+                attempt.getId(), ex.getMessage());
+            return;  // 下一轮重试（DB 已升级，下一轮 Scanner 会重新查状态）
+        }
+
+        // 3. HTTP 查询 requestId 状态（"使用新 lease_version 重发原 requestId"语义）
+        RequestStatusResponse status;
+        try {
+            status = workerHttpClient.findRequestStatus(
+                attempt.getWorkerAddress(), attempt.getRequestId());
+        } catch (WorkerHttpException ex) {
+            log.warn("NodeAttempt {} findRequestStatus HTTP failed after rebindFence: {}",
+                attempt.getId(), ex.getMessage());
+            return;  // Worker Store 已升级；下一轮 Scanner 会重新查询
+        }
+
+        // 4. 按 §47 围栏回写 NodeAttempt（使用新 lease_version 作为围栏）
+        applyWorkerStatusToAttempt(attempt, status, newLeaseVersion, now);
+    }
+
+    /**
+     * 根据 Worker 端响应状态，按 §47 围栏回写 NodeAttempt 终态。
+     *
+     * <p>使用 {@link NodeAttemptMapper#markSuccessFromRecovery} /
+     * {@link NodeAttemptMapper#markFailedFromRecovery} CAS：
+     * <ul>
+     *   <li>CAS 条件：状态 ∈ {DISPATCHING(10), RUNNING(30), UNKNOWN(80)}
+     *       AND attempt_lease_version = #{leaseVersion}（防旧版本反向覆盖）</li>
+     *   <li>CAS 失败：lease_version 不匹配（被其他 Scanner 升级）或状态已终态，等下一轮</li>
+     * </ul>
+     */
+    private void applyWorkerStatusToAttempt(NodeAttemptEntity attempt,
+                                             RequestStatusResponse status,
+                                             Long leaseVersion,
+                                             Instant now) {
+        if (!status.present()) {
+            log.warn("NodeAttempt {} Worker Store has no record for requestId={} "
+                    + "(PROCESS_LOCAL + Pod restart?); wait for execution_deadline_at to converge to TIMEOUT",
+                attempt.getId(), attempt.getRequestId());
+            return;
+        }
+
+        switch (status.state()) {
+            case "RUNNING":
+                log.info("NodeAttempt {} Worker still RUNNING for requestId={}; wait for heartbeat or hard deadline",
+                    attempt.getId(), attempt.getRequestId());
+                return;
+            case "SUCCESS":
+                int updated = attemptMapper.markSuccessFromRecovery(
+                    attempt.getId(),
+                    leaseVersion,
+                    status.resultJson(),
+                    status.resultRef(),
+                    now);
+                if (updated > 0) {
+                    log.info("NodeAttempt {} SUCCESS via recovery (leaseVersion={})",
+                        attempt.getId(), leaseVersion);
+                } else {
+                    log.warn("NodeAttempt {} markSuccessFromRecovery CAS failed (concurrent upgrade or terminal)",
+                        attempt.getId());
+                }
+                return;
+            case "FAILED":
+                int failed = attemptMapper.markFailedFromRecovery(
+                    attempt.getId(),
+                    leaseVersion,
+                    status.errorCode() == null ? "WORKER_REPORTED_FAILED" : status.errorCode(),
+                    status.errorMessage() == null ? "Worker reported FAILED via recovery" : status.errorMessage(),
+                    now);
+                if (failed > 0) {
+                    log.info("NodeAttempt {} FAILED via recovery (leaseVersion={})",
+                        attempt.getId(), leaseVersion);
+                } else {
+                    log.warn("NodeAttempt {} markFailedFromRecovery CAS failed (concurrent upgrade or terminal)",
+                        attempt.getId());
+                }
+                return;
+            default:
+                log.warn("NodeAttempt {} unknown Worker state: {}", attempt.getId(), status.state());
+        }
     }
 
     /**
