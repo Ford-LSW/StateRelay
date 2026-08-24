@@ -4,6 +4,7 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.JsonNodeFactory;
 import com.staterelay.server.persistence.OutboxRepository;
+import com.staterelay.contract.protocol.ExecutionKind;
 import org.springframework.http.HttpStatus;
 import org.springframework.jdbc.core.namedparam.MapSqlParameterSource;
 import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate;
@@ -150,22 +151,8 @@ public final class WorkerService {
                 if (!request.workerEpoch().equals(lease.workerEpoch())) {
                     throw conflict("active execution carries a stale Worker epoch");
                 }
-                int renewed = jdbc.update("""
-                        UPDATE sr_task_attempt
-                        SET lease_expires_at = :leaseExpiresAt,
-                            updated_at = clock_timestamp()
-                        WHERE id = :attemptId
-                          AND lease_version = :leaseVersion
-                          AND worker_id = :workerId
-                          AND worker_epoch = :workerEpoch
-                          AND status IN (:activeStatuses)
-                        """, new MapSqlParameterSource()
-                        .addValue("leaseExpiresAt", leaseExpiresAt, Types.TIMESTAMP_WITH_TIMEZONE)
-                        .addValue("attemptId", lease.attemptId())
-                        .addValue("leaseVersion", lease.leaseVersion())
-                        .addValue("workerId", liveWorkerId)
-                        .addValue("workerEpoch", request.workerEpoch())
-                        .addValue("activeStatuses", ACTIVE_ATTEMPT_STATUSES));
+                int renewed = renewExecutionLease(
+                        liveWorkerId, request.workerEpoch(), lease, leaseExpiresAt);
                 if (renewed != 1) {
                     throw conflict("active execution lease is stale");
                 }
@@ -185,21 +172,34 @@ public final class WorkerService {
                 throw conflict("Worker identity is stale");
             }
             int unreleasedAttempts = jdbc.queryForObject("""
-                    SELECT count(*)::integer
-                    FROM sr_task_attempt
-                    WHERE worker_id = :workerId
-                      AND worker_epoch = :workerEpoch
-                      AND status IN (:activeStatuses)
-                      AND capacity_released_at IS NULL
+                    SELECT CAST((
+                        SELECT count(*)
+                        FROM sr_task_attempt
+                        WHERE worker_id = :workerId
+                          AND worker_epoch = :workerEpoch
+                          AND status IN (:activeStatuses)
+                          AND capacity_released_at IS NULL
+                    ) + (
+                        SELECT count(*)
+                        FROM sr_dag_node_attempt
+                        WHERE worker_id = CAST(:workerId AS varchar)
+                          AND worker_epoch = CAST(:workerEpoch AS varchar)
+                          AND status IN (10, 20, 30, 80)
+                          AND capacity_released_at IS NULL
+                    ) AS integer)
                     """, new MapSqlParameterSource()
                     .addValue("workerId", workerId)
                     .addValue("workerEpoch", request.workerEpoch())
                     .addValue("activeStatuses", ACTIVE_ATTEMPT_STATUSES), Integer.class);
             List<UUID> reportedAttemptIds = request.activeLeases().stream()
-                    .map(ExecutionLease::attemptId)
+                    .filter(lease -> lease.kind() == ExecutionKind.GENERIC_TASK)
+                    .map(lease -> parseGenericAttemptId(lease.attemptId()))
                     .distinct()
                     .toList();
-            int knownReportedAttempts = reportedAttemptIds.size();
+            int knownReportedAttempts = (int) request.activeLeases().stream()
+                    .map(lease -> lease.kind() + ":" + lease.attemptId())
+                    .distinct()
+                    .count();
             int reported = jdbc.update("""
                     UPDATE sr_worker
                     SET status = CASE WHEN status = 'DRAINING' THEN 'DRAINING'
@@ -294,6 +294,16 @@ public final class WorkerService {
                 .addValue("workerId", oldWorker.workerId())
                 .addValue("workerEpoch", oldWorker.workerEpoch())
                 .addValue("activeStatuses", ACTIVE_ATTEMPT_STATUSES));
+        jdbc.update("""
+                UPDATE sr_dag_node_attempt
+                SET attempt_lease_expire_time = clock_timestamp(),
+                    updated_at = clock_timestamp()
+                WHERE worker_id = CAST(:workerId AS varchar)
+                  AND worker_epoch = CAST(:workerEpoch AS varchar)
+                  AND status IN (10, 20, 30, 80)
+                """, new MapSqlParameterSource()
+                .addValue("workerId", oldWorker.workerId())
+                .addValue("workerEpoch", oldWorker.workerEpoch()));
         int offlined = jdbc.update("""
                 UPDATE sr_worker
                 SET status = 'OFFLINE', lease_expires_at = clock_timestamp(),
@@ -510,10 +520,100 @@ public final class WorkerService {
     public record EpochRequest(UUID workerEpoch) {
     }
 
-    public record HandlerMetadata(String name, String implementationType) {
+    public record HandlerMetadata(
+            String name,
+            String implementationType,
+            String algorithmCode,
+            String contractVersion,
+            String contractChecksum,
+            String implementationVersion) {
+
+        public HandlerMetadata(String name, String implementationType) {
+            this(name, implementationType, null, null, null, null);
+        }
     }
 
-    public record ExecutionLease(UUID attemptId, long leaseVersion, UUID workerEpoch) {
+    private int renewExecutionLease(
+            UUID workerId,
+            UUID workerEpoch,
+            ExecutionLease lease,
+            OffsetDateTime leaseExpiresAt) {
+        if (lease.kind() == ExecutionKind.DAG_NODE) {
+            long attemptId = parseDagAttemptId(lease.attemptId());
+            return jdbc.update("""
+                    UPDATE sr_dag_node_attempt attempt
+                    SET attempt_lease_expire_time = :leaseExpiresAt,
+                        updated_at = clock_timestamp()
+                    WHERE attempt.id = :attemptId
+                      AND attempt.attempt_lease_version = :leaseVersion
+                      AND attempt.worker_id = CAST(:workerId AS varchar)
+                      AND attempt.worker_epoch = CAST(:workerEpoch AS varchar)
+                      AND attempt.status IN (10, 20, 30, 80)
+                      AND EXISTS (
+                          SELECT 1
+                          FROM sr_dag_node_instance node
+                          JOIN sr_dag_instance dag ON dag.id = node.dag_instance_id
+                          WHERE node.id = attempt.node_instance_id
+                            AND node.current_attempt_id = attempt.id
+                            AND node.current_attempt_no = attempt.attempt_no
+                            AND node.dispatch_generation = attempt.dispatch_generation
+                            AND node.dispatch_token = attempt.dispatch_token
+                            AND node.status IN (20, 40)
+                            AND dag.status = 10)
+                    """, new MapSqlParameterSource()
+                    .addValue("leaseExpiresAt", leaseExpiresAt, Types.TIMESTAMP_WITH_TIMEZONE)
+                    .addValue("attemptId", attemptId)
+                    .addValue("leaseVersion", lease.leaseVersion())
+                    .addValue("workerId", workerId)
+                    .addValue("workerEpoch", workerEpoch));
+        }
+        return jdbc.update("""
+                UPDATE sr_task_attempt
+                SET lease_expires_at = :leaseExpiresAt,
+                    updated_at = clock_timestamp()
+                WHERE id = :attemptId
+                  AND lease_version = :leaseVersion
+                  AND worker_id = :workerId
+                  AND worker_epoch = :workerEpoch
+                  AND status IN (:activeStatuses)
+                """, new MapSqlParameterSource()
+                .addValue("leaseExpiresAt", leaseExpiresAt, Types.TIMESTAMP_WITH_TIMEZONE)
+                .addValue("attemptId", parseGenericAttemptId(lease.attemptId()))
+                .addValue("leaseVersion", lease.leaseVersion())
+                .addValue("workerId", workerId)
+                .addValue("workerEpoch", workerEpoch)
+                .addValue("activeStatuses", ACTIVE_ATTEMPT_STATUSES));
+    }
+
+    private static UUID parseGenericAttemptId(String attemptId) {
+        try {
+            return UUID.fromString(attemptId);
+        } catch (IllegalArgumentException exception) {
+            throw conflict("generic task attemptId must be a UUID");
+        }
+    }
+
+    private static long parseDagAttemptId(String attemptId) {
+        try {
+            return Long.parseLong(attemptId);
+        } catch (NumberFormatException exception) {
+            throw conflict("DAG node attemptId must be a bigint");
+        }
+    }
+
+    public record ExecutionLease(
+            String attemptId,
+            long leaseVersion,
+            UUID workerEpoch,
+            ExecutionKind kind) {
+
+        public ExecutionLease {
+            kind = kind == null ? ExecutionKind.GENERIC_TASK : kind;
+        }
+
+        public ExecutionLease(UUID attemptId, long leaseVersion, UUID workerEpoch) {
+            this(attemptId.toString(), leaseVersion, workerEpoch, ExecutionKind.GENERIC_TASK);
+        }
     }
 
     public record WorkerRegistration(

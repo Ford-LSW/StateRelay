@@ -1,5 +1,6 @@
 package com.staterelay.server.dag.orchestration;
 
+import com.staterelay.server.dag.dispatch.DagDispatchGateway;
 import com.staterelay.server.dag.mapper.NodeInstanceMapper;
 import com.staterelay.server.dag.mapper.dto.NodeInstanceLease;
 import org.slf4j.Logger;
@@ -20,10 +21,10 @@ import java.util.List;
  *   <li>CAS READY → DISPATCHING（抢占）</li>
  *   <li>查 AlgorithmDefinition（executorGroupCode / timeoutSeconds / maxRetry）</li>
  *   <li>ParameterResolver 解析 inputBindings（失败则 DISPATCHING → FAILED，§17）</li>
- *   <li>查 ExecutorRegistration 选 Worker</li>
+ *   <li>在 {@code sr_worker} 中按应用、环境、能力、租约与容量选择 Worker</li>
  *   <li>无 Worker：schedule_fail_count + 1；未达上限回退 READY，达上限 DISPATCHING → FAILED（§9.1）</li>
- *   <li>有 Worker：创建 NodeAttempt（同步模式直接 RUNNING），NodeInstance DISPATCHING → RUNNING（§11）</li>
- *   <li>同步调用 Worker（第一版只持久化 attempt，HTTP 由后续 Worker 调用层补全）</li>
+ *   <li>有 Worker：原子预留容量、创建 NodeAttempt，并更新 current-attempt fence</li>
+ *   <li>事务提交后调用 Worker；不确定网络结果由独立扫描复用原请求重发</li>
  * </ol>
  *
  * <p>租约过期由 {@link #scanStuckDispatching} 周期回退 DISPATCHING 节点到 READY。
@@ -35,20 +36,36 @@ public class DagNodeDispatchScanner {
 
     private final NodeInstanceMapper nodeInstanceMapper;
     private final DagNodeDispatchService dispatchService;
+    private final DagDispatchGateway dispatchGateway;
     private final int batchSize;
     private final long leaseSeconds;
     private final int stuckScanBatchSize;
+    private final int transportRetryBatchSize;
 
     public DagNodeDispatchScanner(NodeInstanceMapper nodeInstanceMapper,
                                   DagNodeDispatchService dispatchService,
+                                  DagDispatchGateway dispatchGateway,
                                   @Value("${staterelay.dag.dispatch.batch-size:50}") int batchSize,
                                   @Value("${staterelay.dag.dispatch.lease-seconds:30}") long leaseSeconds,
-                                  @Value("${staterelay.dag.dispatch.stuck-scan-batch-size:50}") int stuckScanBatchSize) {
+                                  @Value("${staterelay.dag.dispatch.stuck-scan-batch-size:50}") int stuckScanBatchSize,
+                                  @Value("${staterelay.dag.dispatch.transport-retry-batch-size:50}") int transportRetryBatchSize) {
         this.nodeInstanceMapper = nodeInstanceMapper;
         this.dispatchService = dispatchService;
+        this.dispatchGateway = dispatchGateway;
         this.batchSize = batchSize;
         this.leaseSeconds = leaseSeconds;
         this.stuckScanBatchSize = stuckScanBatchSize;
+        this.transportRetryBatchSize = transportRetryBatchSize;
+    }
+
+    /** Retransmits ACK-uncertain HTTP sends without creating another Attempt. */
+    @Scheduled(fixedDelayString = "${staterelay.dag.dispatch.transport-retry-scan-interval-ms:1000}")
+    public void retryUncertainDispatches() {
+        try {
+            dispatchGateway.retryUncertain(Instant.now(), transportRetryBatchSize);
+        } catch (Exception ex) {
+            log.error("DAG uncertain dispatch retry scan failed: {}", ex.getMessage(), ex);
+        }
     }
 
     /**

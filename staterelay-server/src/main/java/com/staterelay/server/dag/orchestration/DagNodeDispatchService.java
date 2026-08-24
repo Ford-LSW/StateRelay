@@ -1,20 +1,21 @@
 package com.staterelay.server.dag.orchestration;
 
 import com.staterelay.contract.dag.enums.AlgorithmDefinitionStatus;
-import com.staterelay.contract.dag.enums.ExecutorRegistrationStatus;
 import com.staterelay.contract.dag.enums.NodeInstanceStatus;
+import com.staterelay.server.dag.dispatch.DagDispatchCoordinator;
+import com.staterelay.server.dag.dispatch.DagDispatchGateway;
+import com.staterelay.server.dag.dispatch.DagDispatchStore;
 import com.staterelay.server.dag.entity.AlgorithmDefinitionEntity;
 import com.staterelay.server.dag.entity.DagInstanceEntity;
-import com.staterelay.server.dag.entity.ExecutorRegistrationEntity;
 import com.staterelay.server.dag.entity.NodeInstanceEntity;
 import com.staterelay.server.dag.mapper.DagInstanceMapper;
-import com.staterelay.server.dag.mapper.NodeAttemptMapper;
 import com.staterelay.server.dag.mapper.NodeInstanceMapper;
 import com.staterelay.server.dag.mapper.dto.NodeInstanceLease;
 import com.staterelay.server.dag.repository.AlgorithmDefinitionRepository;
 import com.staterelay.server.dag.repository.DagInstanceRepository;
-import com.staterelay.server.dag.repository.ExecutorRegistrationRepository;
 import com.staterelay.server.dag.repository.NodeInstanceJpaRepository;
+import com.staterelay.server.dag.service.AlgorithmContractAdapter;
+import com.staterelay.server.dag.service.DagDefinitionService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
@@ -23,8 +24,6 @@ import org.springframework.transaction.support.TransactionTemplate;
 
 import java.time.Duration;
 import java.time.Instant;
-import java.util.List;
-import java.util.UUID;
 
 /**
  * DAG 节点调度 Service（对齐文档 §26 / §27）。
@@ -33,17 +32,18 @@ import java.util.UUID;
  * <ol>
  *   <li>查询 NodeInstance + DagInstance + AlgorithmDefinition</li>
  *   <li>调用 {@link ParameterResolver#resolve} 解析参数（失败则 DISPATCHING → FAILED，§17）</li>
- *   <li>查 {@link ExecutorRegistrationEntity} 选 Worker</li>
+ *   <li>在统一的 {@code sr_worker} 注册表中选择 Worker 并原子预留容量</li>
  *   <li>无 Worker：
  *      <ul>
  *          <li>schedule_fail_count 未达上限：CAS DISPATCHING → READY，不创建 Attempt</li>
  *          <li>schedule_fail_count 已达上限：CAS DISPATCHING → FAILED，+1 finished_node_count</li>
  *      </ul>
  *   </li>
- *   <li>有 Worker：插入 NodeAttempt（同步模式直接 RUNNING），CAS NodeInstance DISPATCHING → RUNNING</li>
+ *   <li>有 Worker：同一事务创建 NodeAttempt、写入 current-attempt fence，再在提交后发送 HTTP</li>
  * </ol>
  *
- * <p>第一版不实现 Worker HTTP 调用：仅持久化 NodeAttempt，由后续 Worker 状态回报触发推进。
+ * <p>HTTP 明确拒绝时释放容量并回退节点；ACK 丢失或网络异常进入 UNCERTAIN，
+ * 后续重试复用同一个 requestId 与 attemptId。
  *
  * <p>事务管理：使用 {@link TransactionTemplate} 显式开启事务，避免 Spring AOP 自调用代理失效问题。
  */
@@ -56,10 +56,11 @@ public class DagNodeDispatchService {
     private final NodeInstanceJpaRepository nodeInstanceRepository;
     private final DagInstanceMapper dagInstanceMapper;
     private final DagInstanceRepository dagInstanceRepository;
-    private final NodeAttemptMapper nodeAttemptMapper;
     private final AlgorithmDefinitionRepository algorithmDefinitionRepository;
-    private final ExecutorRegistrationRepository executorRegistrationRepository;
     private final ParameterResolver parameterResolver;
+    private final AlgorithmContractAdapter algorithmContractAdapter;
+    private final DagDefinitionService dagDefinitionService;
+    private final DagDispatchGateway dispatchGateway;
     private final TransactionTemplate transactions;
     private final int maxScheduleFailCount;
     private final int noWorkerRetryIntervalSeconds;
@@ -69,10 +70,11 @@ public class DagNodeDispatchService {
                                    NodeInstanceJpaRepository nodeInstanceRepository,
                                    DagInstanceMapper dagInstanceMapper,
                                    DagInstanceRepository dagInstanceRepository,
-                                   NodeAttemptMapper nodeAttemptMapper,
                                    AlgorithmDefinitionRepository algorithmDefinitionRepository,
-                                   ExecutorRegistrationRepository executorRegistrationRepository,
                                    ParameterResolver parameterResolver,
+                                   AlgorithmContractAdapter algorithmContractAdapter,
+                                   DagDefinitionService dagDefinitionService,
+                                   DagDispatchGateway dispatchGateway,
                                    TransactionTemplate transactions,
                                    @Value("${staterelay.dag.scheduler.max-schedule-fail-count:10}") int maxScheduleFailCount,
                                    @Value("${staterelay.dag.scheduler.no-worker-retry-interval-seconds:5}") int noWorkerRetryIntervalSeconds,
@@ -81,10 +83,11 @@ public class DagNodeDispatchService {
         this.nodeInstanceRepository = nodeInstanceRepository;
         this.dagInstanceMapper = dagInstanceMapper;
         this.dagInstanceRepository = dagInstanceRepository;
-        this.nodeAttemptMapper = nodeAttemptMapper;
         this.algorithmDefinitionRepository = algorithmDefinitionRepository;
-        this.executorRegistrationRepository = executorRegistrationRepository;
         this.parameterResolver = parameterResolver;
+        this.algorithmContractAdapter = algorithmContractAdapter;
+        this.dagDefinitionService = dagDefinitionService;
+        this.dispatchGateway = dispatchGateway;
         this.transactions = transactions;
         this.maxScheduleFailCount = maxScheduleFailCount;
         this.noWorkerRetryIntervalSeconds = noWorkerRetryIntervalSeconds;
@@ -129,26 +132,50 @@ public class DagNodeDispatchService {
 
         // 2. ParameterResolver 解析（§16 / §17）
         String requestJson;
+        boolean algorithmProtocol;
         try {
-            requestJson = parameterResolver.resolve(instance, node);
+            algorithmProtocol = isAlgorithmNode(instance, node);
+            requestJson = algorithmProtocol
+                ? parameterResolver.resolve(instance, node, algorithmContractAdapter.toContract(algo))
+                : parameterResolver.resolve(instance, node);
         } catch (InputResolveException ex) {
             transactions.executeWithoutResult(status ->
                 handleParameterResolveFailure(node, ex, now));
             return;
-        }
-
-        // 3. 查 ExecutorRegistration 找 Worker
-        ExecutorRegistrationEntity worker = selectWorker(algo.getExecutorGroupCode(), now);
-        if (worker == null) {
+        } catch (IllegalArgumentException ex) {
+            InputResolveException wrapped = new InputResolveException(
+                "Invalid algorithm contract for " + algorithmCode, ex);
             transactions.executeWithoutResult(status ->
-                handleNoWorker(node, algo, now));
+                handleParameterResolveFailure(node, wrapped, now));
             return;
         }
 
-        // 4. 有 Worker：创建 NodeAttempt + CAS NodeInstance DISPATCHING → RUNNING（同步模式，T5）
-        final String finalRequestJson = requestJson;
-        transactions.executeWithoutResult(status ->
-            executeWithWorker(node, algo, worker, finalRequestJson, now));
+        // 3. 在 sr_worker 上原子预留容量、创建 Attempt、更新 current-attempt fence；
+        //    reservation 事务提交后才发送真实 HTTP。
+        Integer timeoutSeconds = algo.getTimeoutSeconds() == null ? 300 : algo.getTimeoutSeconds();
+        DagDispatchCoordinator.Outcome outcome = dispatchGateway.dispatch(
+            new DagDispatchStore.ReservationRequest(
+                node.getDagInstanceId(), node.getId(), node.getNodeId(), algorithmCode,
+                algorithmProtocol, algo.getContractVersion(), algo.getContractChecksum(),
+                algo.getExecutorGroupCode(), requestJson,
+                computeRequestChecksum(algo.getAlgorithmCode(), requestJson),
+                Duration.ofSeconds(workerLeaseSeconds), Duration.ofSeconds(timeoutSeconds)),
+            now);
+        if (outcome == DagDispatchCoordinator.Outcome.NO_WORKER) {
+            transactions.executeWithoutResult(status ->
+                handleNoWorker(node, algo, now));
+        }
+    }
+
+    private boolean isAlgorithmNode(DagInstanceEntity instance, NodeInstanceEntity node) {
+        return dagDefinitionService.findVersionEntity(instance.getDagDefinitionVersionId())
+            .map(dagDefinitionService::loadSnapshot)
+            .flatMap(snapshot -> snapshot.getNodes().stream()
+                .filter(candidate -> node.getNodeId().equals(candidate.getId()))
+                .findFirst())
+            .map(dagNode -> dagNode.getAlgorithmCode() != null && !dagNode.getAlgorithmCode().isBlank())
+            .orElseThrow(() -> new InputResolveException(
+                "DAG node definition not found for runtime protocol: " + node.getNodeId()));
     }
 
     /**
@@ -219,76 +246,6 @@ public class DagNodeDispatchService {
             log.error("NodeInstance {} FAILED (no available worker, schedule_fail_count={})",
                 node.getId(), newFailCount);
         }
-    }
-
-    /**
-     * 有 Worker：创建 NodeAttempt + CAS DISPATCHING → RUNNING（同步模式，T5/T8）。
-     *
-     * <p>对齐文档 §27 / §43：
-     * <ul>
-     *   <li>固定 requestId（后续重发 / rebindFence 复用）</li>
-     *   <li>attempt_lease_version = 1（首次创建）</li>
-     *   <li>attempt_lease_expire_time = now + workerLeaseSeconds（heartbeat 可续约）</li>
-     *   <li>execution_deadline_at = now + timeout_seconds（不可续约硬截止，T8 创建时一次性固化）</li>
-     *   <li>worker_epoch 取自 ExecutorRegistration（旧 epoch 一律不能覆盖）</li>
-     * </ul>
-     *
-     * <p>第一版 NodeAttempt 在同步模式下直接进入 RUNNING，跳过 DISPATCHING/ACCEPTED 中间状态。
-     * HTTP 调用由后续 Worker 状态回报模块处理；容量拒绝回报走 T6C 事务（§27.2）。
-     */
-    private void executeWithWorker(NodeInstanceEntity node, AlgorithmDefinitionEntity algo,
-                                   ExecutorRegistrationEntity worker, String requestJson, Instant now) {
-        Integer currentAttemptNo = (node.getCurrentAttemptNo() == null ? 0 : node.getCurrentAttemptNo()) + 1;
-        String requestId = UUID.randomUUID().toString();
-
-        // T8：固定 requestId + lease 围栏 + 不可续约硬截止（§27 / §43）
-        Long attemptLeaseVersion = 1L;
-        Instant attemptLeaseExpireTime = now.plus(Duration.ofSeconds(workerLeaseSeconds));
-        Integer timeoutSeconds = algo.getTimeoutSeconds() != null ? algo.getTimeoutSeconds() : 300;
-        Instant executionDeadlineAt = now.plus(Duration.ofSeconds(timeoutSeconds));
-
-        NodeAttemptMapper.NodeAttemptInsert attemptInsert = new NodeAttemptMapper.NodeAttemptInsert(
-            node.getDagInstanceId(),
-            node.getId(),
-            currentAttemptNo,
-            requestId,
-            computeRequestChecksum(algo.getAlgorithmCode(), requestJson),
-            algo.getAlgorithmCode(),
-            worker.getWorkerId(),
-            worker.getAddress(),
-            null,  // worker_epoch：T8 创建时尚无 epoch；由 rebindFence 接管恢复时重绑（§19.1 / §43）
-            requestJson,
-            attemptLeaseVersion,
-            attemptLeaseExpireTime,
-            executionDeadlineAt);
-        nodeAttemptMapper.insert(attemptInsert, now);
-
-        // CAS NodeInstance DISPATCHING → RUNNING（同步模式跳过 DISPATCHED，§11）
-        int updated = nodeInstanceMapper.markRunning(node.getId(), now);
-        if (updated == 0) {
-            log.warn("NodeInstance {} CAS DISPATCHING → RUNNING failed (state changed by other thread)",
-                node.getId());
-            return;
-        }
-        log.info("NodeInstance {} dispatched to worker {} (attemptNo={}, algorithm={}, leaseVersion={}, deadline={})",
-            node.getId(), worker.getWorkerId(), currentAttemptNo, algo.getAlgorithmCode(),
-            attemptLeaseVersion, executionDeadlineAt);
-    }
-
-    /**
-     * 第一版 Worker 选择策略：从 ONLINE + lease 未过期的 Worker 中选第一个。
-     *
-     * <p>后续可扩展为 PowerOfTwoChoices / 加权选择 / capabilities 过滤。
-     * capabilities 校验第一版暂不实现（依赖 AlgorithmDefinition 与 Worker capabilities 的协议）。
-     */
-    private ExecutorRegistrationEntity selectWorker(String executorGroupCode, Instant now) {
-        List<ExecutorRegistrationEntity> workers = executorRegistrationRepository
-            .findByExecutorGroupCodeAndStatus(executorGroupCode, ExecutorRegistrationStatus.ONLINE);
-        return workers.stream()
-            .filter(w -> w.getLeaseExpireTime() != null && w.getLeaseExpireTime().isAfter(now))
-            .filter(w -> w.getMaxConcurrency() != null && w.getMaxConcurrency() > 0)
-            .findFirst()
-            .orElse(null);
     }
 
     /**

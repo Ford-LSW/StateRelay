@@ -25,7 +25,7 @@
     <!-- 批量创建节点实例，统一初始化为 WAITING(0) -->
     <insert id="batchInsert">
         INSERT INTO sr_dag_node_instance
-            (dag_instance_id, node_id, node_name, handler_name, status,
+            (dag_instance_id, node_id, node_name_snapshot, handler_name_snapshot, status,
              retry_count, current_attempt_no, schedule_fail_count,
              created_at, updated_at)
         VALUES
@@ -59,8 +59,8 @@
     <update id="markReady">
         UPDATE sr_dag_node_instance
         SET status = 10,
-            bindings = #{bindings},
-            last_progress_time = #{now},
+            input_bindings_snapshot = #{bindings},
+            ready_at = #{now},
             updated_at = #{now}
         WHERE id = #{nodeInstanceId}
           AND status = 0
@@ -68,7 +68,7 @@
 
     <!-- Scheduler 扫描可领取的 READY 节点（§26） -->
     <select id="scanReadyNodes" resultMap="NodeInstanceLeaseMap">
-        SELECT id, dag_instance_id, node_id, node_name, handler_name,
+        SELECT id, dag_instance_id, node_id, node_name_snapshot AS node_name, handler_name_snapshot AS handler_name,
                dispatch_owner, dispatch_lease_expire_time
         FROM sr_dag_node_instance
         WHERE status = 10
@@ -84,7 +84,6 @@
         SET status = 20,
             dispatch_owner = #{dispatchOwner},
             dispatch_lease_expire_time = #{dispatchLeaseExpireTime},
-            last_progress_time = #{now},
             updated_at = #{now}
         WHERE id = #{nodeInstanceId}
           AND status = 10
@@ -94,36 +93,39 @@
     <update id="markDispatched">
         UPDATE sr_dag_node_instance
         SET status = 30,
-            last_progress_time = #{now},
             updated_at = #{now}
         WHERE id = #{nodeInstanceId}
           AND status = 20
     </update>
 
     <!-- CAS: DISPATCHING(20) / DISPATCHED(30) → RUNNING(40)
-         对齐文档 §11：同步模式跳过 DISPATCHED，由 DISPATCHING 直接到 RUNNING -->
+         对齐文档 §11：同步模式跳过 DISPATCHED，由 DISPATCHING 直接到 RUNNING
+         同时固化 current_attempt_no，供 NodeAttemptSyncService 围栏校验（§16.2） -->
     <update id="markRunning">
         UPDATE sr_dag_node_instance
         SET status = 40,
+            current_attempt_no = #{attemptNo},
             dispatch_owner = NULL,
             dispatch_lease_expire_time = NULL,
-            last_progress_time = #{now},
+            started_at = COALESCE(started_at, #{now}),
             updated_at = #{now}
         WHERE id = #{nodeInstanceId}
           AND status IN (20, 30)
     </update>
 
-    <!-- CAS: RUNNING(40) → SUCCESS(50) -->
+    <!-- CAS: RUNNING(40) → SUCCESS(50)
+         增加 current_attempt_no 围栏（§16.2），防止晚到 Attempt 覆盖当前权威 Attempt -->
     <select id="markSuccess" resultMap="NodeCompletionSnapshotMap">
         UPDATE sr_dag_node_instance
         SET status = 50,
             result_json = #{resultJson},
             result_ref = #{resultRef},
-            last_progress_time = #{now},
+            finished_at = #{now},
             updated_at = #{now}
         WHERE id = #{nodeInstanceId}
           AND status = 40
-        RETURNING id, dag_instance_id, node_id, handler_name, result_json, result_ref
+          AND current_attempt_no = #{attemptNo}
+        RETURNING id, dag_instance_id, node_id, handler_name_snapshot AS handler_name, result_json, result_ref
     </select>
 
     <!-- CAS: RUNNING(40) → FAILED(60)（执行失败且重试耗尽，§29.3） -->
@@ -132,7 +134,6 @@
         SET status = 60,
             error_code = #{errorCode},
             error_message = #{errorMessage},
-            last_progress_time = #{now},
             updated_at = #{now}
         WHERE id = #{nodeInstanceId}
           AND status = 40
@@ -144,7 +145,6 @@
         SET status = 90,
             error_code = #{errorCode},
             error_message = #{errorMessage},
-            last_progress_time = #{now},
             updated_at = #{now}
         WHERE id = #{nodeInstanceId}
           AND status = 40
@@ -157,7 +157,6 @@
         SET status = 60,
             error_code = #{errorCode},
             error_message = #{errorMessage},
-            last_progress_time = #{now},
             updated_at = #{now}
         WHERE id = #{nodeInstanceId}
           AND status = 20
@@ -170,7 +169,6 @@
             schedule_fail_count = #{scheduleFailCount},
             error_code = #{errorCode},
             error_message = #{errorMessage},
-            last_progress_time = #{now},
             updated_at = #{now}
         WHERE id = #{nodeInstanceId}
           AND status = 20
@@ -180,23 +178,20 @@
     <update id="markSkipped">
         UPDATE sr_dag_node_instance
         SET status = 80,
-            last_progress_time = #{now},
             updated_at = #{now}
         WHERE id = #{nodeInstanceId}
           AND status = 0
     </update>
 
     <!-- CAS: 回退到 READY(10)（重试，§29.2 / §29.4）
-         retry_count 和 current_attempt_no 自增 -->
+         这里只增加 retry_count；attempt_no 仅在真实创建下一条 Attempt 时递增。 -->
     <update id="revertToReady">
         UPDATE sr_dag_node_instance
         SET status = 10,
             retry_count = retry_count + 1,
-            current_attempt_no = current_attempt_no + 1,
             dispatch_owner = NULL,
             dispatch_lease_expire_time = NULL,
             next_schedule_time = #{nextScheduleTime},
-            last_progress_time = #{now},
             updated_at = #{now}
         WHERE id = #{nodeInstanceId}
           AND status IN (20, 30, 40, 90)
@@ -213,7 +208,6 @@
             dispatch_owner = NULL,
             dispatch_lease_expire_time = NULL,
             next_schedule_time = #{nextScheduleTime},
-            last_progress_time = #{now},
             updated_at = #{now}
         WHERE id = #{nodeInstanceId}
           AND status = 20
@@ -231,7 +225,6 @@
             dispatch_owner = NULL,
             dispatch_lease_expire_time = NULL,
             next_schedule_time = #{nextScheduleTime},
-            last_progress_time = #{now},
             updated_at = #{now}
         WHERE id = #{nodeInstanceId}
           AND status = 40
@@ -254,6 +247,7 @@
         SELECT id
         FROM sr_dag_node_instance
         WHERE status = 20
+          AND current_attempt_id IS NULL
           AND dispatch_lease_expire_time &lt; #{now}
         ORDER BY dispatch_lease_expire_time, id
         LIMIT #{batchSize}
@@ -267,7 +261,6 @@
             cancel_reason = #{cancelReason},
             dispatch_owner = NULL,
             dispatch_lease_expire_time = NULL,
-            last_progress_time = #{now},
             updated_at = #{now}
         WHERE dag_instance_id = #{dagInstanceId}
           AND status IN (0, 10, 20)
@@ -279,7 +272,6 @@
         UPDATE sr_dag_node_instance
         SET status = 70,
             cancel_reason = #{cancelReason},
-            last_progress_time = #{now},
             updated_at = #{now}
         WHERE dag_instance_id = #{dagInstanceId}
           AND status = 40

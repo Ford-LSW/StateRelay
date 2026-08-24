@@ -168,7 +168,7 @@ public class NodeAttemptLeaseRecoverScanner {
      *
      * <p>第一版简化：所有 lease 到期都走 RebindFenceNewEpoch 路径
      * （兼容同 epoch 和跨 epoch 场景；Worker Store 不在线时 HTTP 失败由 fail-closed 兜底）。
-     * 实际生产应查 ExecutorRegistration 判断原 epoch 是否仍存活：
+     * 实际生产应查统一的 {@code sr_worker} 注册表判断原 epoch 是否仍存活：
      * <ul>
      *   <li>原 epoch 在线 → RESendOriginalEpoch（直接重发，不升级 lease_version）</li>
      *   <li>DURABLE + 同 worker_id 新 epoch → RebindFenceNewEpoch（CAS 升级 + rebindFence + 重发）</li>
@@ -229,7 +229,7 @@ public class NodeAttemptLeaseRecoverScanner {
         // 1. DB CAS 升级 attempt_lease_version + 重绑 worker_epoch + 重置 lease_expire_time
         //    前置条件（fail-closed）：newLeaseVersion > currentLeaseVersion（单调递增）
         Instant newLeaseExpireTime = now.plus(Duration.ofSeconds(workerLeaseSeconds));
-        // 注：第一版 worker_epoch 暂用原值；实际应来自 ExecutorRegistration 的新 epoch
+        // 注：第一版 worker_epoch 暂用原值；实际应来自 sr_worker 的新 epoch
         String newWorkerEpoch = attempt.getWorkerEpoch();
 
         int updated = attemptMapper.incrementLeaseVersion(

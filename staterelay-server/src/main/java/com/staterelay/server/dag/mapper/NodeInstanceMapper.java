@@ -81,8 +81,13 @@ public interface NodeInstanceMapper {
      * CAS: DISPATCHING(20) / DISPATCHED(30) → RUNNING(40)（Worker 开始执行，§11 / §27 step 7）。
      *
      * <p>同步模式：DISPATCHING → RUNNING；异步模式：DISPATCHED → RUNNING。
+     *
+     * <p>同时固化 {@code current_attempt_no = #{attemptNo}}（GIS-Worker 设计文档 §16.2 围栏校验依据）：
+     * NodeAttemptSyncService 在 Attempt SUCCESS 时校验
+     * {@code attempt.attemptNo == node.currentAttemptNo} 以识别晚到 Attempt。
      */
     int markRunning(@Param("nodeInstanceId") Long nodeInstanceId,
+                    @Param("attemptNo") Integer attemptNo,
                     @Param("now") Instant now);
 
     /**
@@ -90,8 +95,14 @@ public interface NodeInstanceMapper {
      * 在同一事务内与 Attempt → SUCCESS、后继 → READY 一起完成。
      *
      * <p>事务边界 T2：调用方在同事务内调 {@link DagInstanceMapper#incrementFinishedCount}（§29.1 / §39.1）。
+     *
+     * <p><b>Attempt 围栏（GIS-Worker 设计文档 §16.2）：</b>
+     * CAS 条件增加 {@code current_attempt_no = #{attemptNo}}，防止晚到 Attempt 的 SUCCESS
+     * 覆盖当前权威 Attempt。若 CAS 返回 null（snapshot == null），调用方应将本 Attempt
+     * 的 STAGED Artifact 标记为 ORPHANED。
      */
     NodeCompletionSnapshot markSuccess(@Param("nodeInstanceId") Long nodeInstanceId,
+                                       @Param("attemptNo") Integer attemptNo,
                                        @Param("resultJson") String resultJson,
                                        @Param("resultRef") String resultRef,
                                        @Param("now") Instant now);
@@ -150,7 +161,8 @@ public interface NodeInstanceMapper {
      * <p>从 DISPATCHING(20) / DISPATCHED(30) / RUNNING(40) / TIMEOUT(90) 回退。
      * 重试场景下不增加 finished_node_count（未进入终态）。
      *
-     * <p>SQL 中 retry_count 和 current_attempt_no 自增（避免 Java 传值造成丢失更新）。
+     * <p>SQL 只增加 retry_count；current_attempt_no 由下一次真实 Attempt 创建事务写入，
+     * 避免重试计数和物理 Attempt 编号各自加一次。
      */
     int revertToReady(@Param("nodeInstanceId") Long nodeInstanceId,
                       @Param("nextScheduleTime") Instant nextScheduleTime,

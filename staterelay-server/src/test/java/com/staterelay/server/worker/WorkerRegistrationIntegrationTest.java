@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.staterelay.server.persistence.OutboxRepository;
 import com.staterelay.server.persistence.PostgresRepositoryTestSupport;
 import com.staterelay.server.support.PostgresTestConfiguration;
+import com.staterelay.contract.protocol.ExecutionKind;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -35,9 +36,41 @@ class WorkerRegistrationIntegrationTest extends PostgresRepositoryTestSupport {
 
     @BeforeEach
     void createService() {
+        jdbcTemplate.execute("""
+                TRUNCATE TABLE sr_dag_node_attempt, sr_dag_node_instance, sr_dag_instance,
+                    sr_dag_node_edge, sr_dag_edge, sr_dag_definition_version,
+                    sr_dag_definition CASCADE
+                """);
         service = new WorkerService(jdbc, transactions,
                 new OutboxRepository(jdbc, objectMapper), objectMapper,
                 Duration.ofSeconds(35));
+    }
+
+    @Test
+    void heartbeatKeepsCapacityReservedForActiveDagAttempts() {
+        UUID applicationId = UUID.randomUUID();
+        jdbcTemplate.update("INSERT INTO sr_application(id, name) VALUES (?, ?)",
+                applicationId, "GIS_EXECUTOR");
+        UUID workerId = UUID.randomUUID();
+        UUID workerEpoch = UUID.randomUUID();
+        service.register(new WorkerService.RegistrationRequest(
+                "GIS_EXECUTOR", "default", workerId, workerEpoch,
+                "gis-0", "10.0.0.9", 8080, 4, 0,
+                Duration.ofSeconds(35), "0.2.0", Set.of()));
+        long attemptId = insertActiveDagAttempt(workerId, workerEpoch);
+        Instant beforeHeartbeat = dagAttemptLeaseExpiry(attemptId);
+        jdbcTemplate.update("UPDATE sr_worker SET reserved_capacity = 1 WHERE id = ?", workerId);
+
+        service.heartbeat(workerId, new WorkerService.HeartbeatRequest(
+                "GIS_EXECUTOR", workerId, workerEpoch, "READY", 1, 0,
+                4, 0, Duration.ofSeconds(35), "0.2.0", Set.of(), List.of(
+                new WorkerService.ExecutionLease(
+                        Long.toString(attemptId), 1, workerEpoch, ExecutionKind.DAG_NODE))));
+
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT reserved_capacity FROM sr_worker WHERE id = ?",
+                Integer.class, workerId)).isOne();
+        assertThat(dagAttemptLeaseExpiry(attemptId)).isAfter(beforeHeartbeat);
     }
 
     @Test
@@ -99,7 +132,8 @@ class WorkerRegistrationIntegrationTest extends PostgresRepositoryTestSupport {
                 "order-service", workerId, workerEpoch, "READY", 3, 7,
                 20, 80, Duration.ofSeconds(41), "0.2.0",
                 Set.of(new WorkerService.HandlerMetadata(
-                "archiveOrders", FirstHandler.class.getName())),
+                "GDAL_INTERSECTION", FirstHandler.class.getName(),
+                "GDAL_INTERSECTION", "1.0", "sha256:contract", "2026.08.23")),
                 List.of(new WorkerService.ExecutionLease(
                         attempt.attemptId(), 7, workerEpoch))));
 
@@ -120,9 +154,19 @@ class WorkerRegistrationIntegrationTest extends PostgresRepositoryTestSupport {
                 .containsEntry("queue_capacity", 80)
                 .containsEntry("starter_version", "0.2.0")
                 .containsEntry("effective_load", 3);
-        assertThat(jdbcTemplate.queryForObject(
-                "SELECT handlers->0->>'name' FROM sr_worker WHERE id = ?",
-                String.class, workerId)).isEqualTo("archiveOrders");
+        assertThat(jdbcTemplate.queryForMap("""
+                SELECT handlers->0->>'name' AS name,
+                    handlers->0->>'algorithmCode' AS algorithm_code,
+                    handlers->0->>'contractVersion' AS contract_version,
+                    handlers->0->>'contractChecksum' AS contract_checksum,
+                    handlers->0->>'implementationVersion' AS implementation_version
+                FROM sr_worker WHERE id = ?
+                """, workerId))
+                .containsEntry("name", "GDAL_INTERSECTION")
+                .containsEntry("algorithm_code", "GDAL_INTERSECTION")
+                .containsEntry("contract_version", "1.0")
+                .containsEntry("contract_checksum", "sha256:contract")
+                .containsEntry("implementation_version", "2026.08.23");
         assertThat(jdbcTemplate.queryForObject(
                 "SELECT reported_active_attempt_ids::text FROM sr_worker WHERE id = ?",
                 String.class, workerId)).isEqualTo("{" + attempt.attemptId() + "}");
@@ -302,6 +346,52 @@ class WorkerRegistrationIntegrationTest extends PostgresRepositoryTestSupport {
         jdbcTemplate.update(
                 "UPDATE sr_worker SET reserved_capacity = 1 WHERE id = ?", workerId);
         return new ActiveAttempt(instanceId, attemptId);
+    }
+
+    private long insertActiveDagAttempt(UUID workerId, UUID workerEpoch) {
+        jdbcTemplate.update("""
+                INSERT INTO sr_dag_definition(id, app_id, dag_code, dag_name)
+                VALUES (9001, 1, 'CAPACITY_DAG', 'Capacity DAG')
+                """);
+        jdbcTemplate.update("""
+                INSERT INTO sr_dag_definition_version(
+                    id, dag_definition_id, version_no, status, definition_snapshot, definition_hash)
+                VALUES (9002, 9001, 1, 10, '{"nodes":[]}'::jsonb, 'capacity-hash')
+                """);
+        jdbcTemplate.update("""
+                INSERT INTO sr_dag_instance(
+                    id, dag_definition_version_id, dag_code_snapshot, dag_version_snapshot,
+                    definition_hash_snapshot, idempotency_key, status)
+                VALUES (9003, 9002, 'CAPACITY_DAG', 1, 'capacity-hash', 'capacity-instance', 10)
+                """);
+        jdbcTemplate.update("""
+                INSERT INTO sr_dag_node_instance(
+                    id, dag_instance_id, node_id, handler_name_snapshot, status)
+                VALUES (9004, 9003, 'A', 'ALGO', 20)
+                """);
+        jdbcTemplate.update("""
+                INSERT INTO sr_dag_node_attempt(
+                    id, dag_instance_id, node_instance_id, attempt_no, request_id,
+                    request_checksum, algorithm_code, worker_id, worker_epoch, status,
+                    attempt_lease_version, attempt_lease_expire_time,
+                    dispatch_generation, dispatch_token)
+                VALUES (9005, 9003, 9004, 1, 'capacity-request', 'capacity-checksum',
+                    'ALGO', ?, ?, 10, 1, clock_timestamp() + interval '1 second', 1,
+                    'capacity-token')
+                """, workerId.toString(), workerEpoch.toString());
+        jdbcTemplate.update("""
+                UPDATE sr_dag_node_instance
+                SET current_attempt_id = 9005, current_attempt_no = 1,
+                    dispatch_generation = 1, dispatch_token = 'capacity-token'
+                WHERE id = 9004
+                """);
+        return 9005L;
+    }
+
+    private Instant dagAttemptLeaseExpiry(long attemptId) {
+        return jdbcTemplate.queryForObject(
+                "SELECT attempt_lease_expire_time FROM sr_dag_node_attempt WHERE id = ?",
+                OffsetDateTime.class, attemptId).toInstant();
     }
 
     private String workerStatus(UUID workerId) {

@@ -114,7 +114,7 @@ public class DagInstanceService {
         // 同事务批量创建全部 NodeInstance，统一初始化为 WAITING，不解析拓扑（对齐文档 §5.1）
         if (snapshot.getNodes() != null && !snapshot.getNodes().isEmpty()) {
             List<NodeInstanceMapper.NodeInsert> nodes = snapshot.getNodes().stream()
-                .map(n -> new NodeInstanceMapper.NodeInsert(n.getId(), n.getName(), n.getHandler()))
+                .map(n -> new NodeInstanceMapper.NodeInsert(n.getId(), n.getName(), executableCode(n)))
                 .toList();
             nodeInstanceMapper.batchInsert(saved.getId(), nodes, now);
         }
@@ -142,6 +142,13 @@ public class DagInstanceService {
      */
     public List<NodeInstanceEntity> listNodes(Long instanceId) {
         return nodeInstanceRepository.findByDagInstanceId(instanceId);
+    }
+
+    private String executableCode(DagDefinition.DagNode node) {
+        if (node.getAlgorithmCode() != null && !node.getAlgorithmCode().isBlank()) {
+            return node.getAlgorithmCode();
+        }
+        return node.getHandler();
     }
 
     /**

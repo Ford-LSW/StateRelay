@@ -61,6 +61,15 @@ public class NodeInstanceEntity {
     @Column(name = "current_attempt_no", nullable = false)
     private Integer currentAttemptNo = 0;
 
+    @Column(name = "current_attempt_id")
+    private Long currentAttemptId;
+
+    @Column(name = "dispatch_generation")
+    private Long dispatchGeneration;
+
+    @Column(name = "dispatch_token", length = 128)
+    private String dispatchToken;
+
     /**
      * Scheduler 已领取 Node 但因没有可用 Worker 而调度失败的次数（§9.1）。
      * 与 {@link #retryCount} 含义严格分开：调度失败不创建 NodeAttempt，不增加 retry_count。

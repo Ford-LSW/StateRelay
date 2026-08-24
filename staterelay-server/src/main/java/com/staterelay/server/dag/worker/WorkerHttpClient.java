@@ -3,6 +3,8 @@ package com.staterelay.server.dag.worker;
 import com.staterelay.contract.protocol.RebindFenceRequest;
 import com.staterelay.contract.protocol.RebindFenceResponse;
 import com.staterelay.contract.protocol.RequestStatusResponse;
+import com.staterelay.contract.protocol.DispatchAck;
+import com.staterelay.contract.protocol.ExecuteTaskCommand;
 
 /**
  * Server 端调用 Worker 围栏协议 HTTP 客户端（对齐文档 §19.1 / §44.2 / §47.1）。
@@ -21,10 +23,13 @@ import com.staterelay.contract.protocol.RequestStatusResponse;
  */
 public interface WorkerHttpClient {
 
+    /** Sends one concrete DAG execution command to the selected Worker. */
+    DispatchAck execute(String workerAddress, ExecuteTaskCommand command);
+
     /**
      * 查询 Worker 端 requestId 当前状态（§19.1 分支 A "重发原 requestId"语义）。
      *
-     * @param workerAddress Worker 地址（host:port，来自 ExecutorRegistrationEntity.address）
+     * @param workerAddress Worker 地址（host:port，来自统一 {@code sr_worker} 注册表）
      * @param requestId     NodeAttempt.requestId
      * @return Worker 端记录的当前状态；present=false 表示 Worker 端无此记录
      * @throws WorkerHttpException 网络/超时/5xx 等失败场景

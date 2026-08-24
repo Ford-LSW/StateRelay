@@ -1,0 +1,117 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.staterelay.server.dag.mapper.DagArtifactMapper">
+
+    <resultMap id="ArtifactMetadataMap" type="com.staterelay.contract.dag.artifact.ArtifactMetadataResponse">
+        <id     property="artifactId"     column="id"/>
+        <result property="status"         column="status_enum"/>
+        <result property="storageType"    column="storage_type_enum"/>
+        <result property="format"         column="format"/>
+        <result property="objectKey"      column="object_key"/>
+        <result property="checksum"       column="checksum"/>
+        <result property="dagInstanceId"  column="dag_instance_id"/>
+        <result property="nodeId"         column="node_id"/>
+        <result property="attemptNo"      column="attempt_no"/>
+        <result property="createdAt"      column="created_at"/>
+    </resultMap>
+
+    <!-- =====================================================================
+         promoteStagedToAvailableByAttempt: 批量 STAGED(20) → AVAILABLE(30)
+         围栏：dag_instance_id + node_id + attempt_no 精确定位当前权威 Attempt 的成果
+         §16.2：只有通过围栏校验的 Attempt 才能把 Artifact 提升为 AVAILABLE
+         ===================================================================== -->
+    <update id="promoteStagedToAvailableByAttempt">
+        UPDATE sr_dag_artifact
+        SET status = 30,
+            updated_at = #{now}
+        WHERE dag_instance_id = #{dagInstanceId}
+          AND node_id = #{nodeId}
+          AND attempt_no = #{attemptNo}
+          AND status = 20
+    </update>
+
+    <!-- =====================================================================
+         markStagedAsOrphanedByAttempt: 批量 STAGED(20) → ORPHANED(40)
+         §16.2 / §16.3：晚到 / 失败 Attempt 的成果不能成为权威，进入 ORPHANED 等待清理
+         ===================================================================== -->
+    <update id="markStagedAsOrphanedByAttempt">
+        UPDATE sr_dag_artifact
+        SET status = 40,
+            updated_at = #{now}
+        WHERE dag_instance_id = #{dagInstanceId}
+          AND node_id = #{nodeId}
+          AND attempt_no = #{attemptNo}
+          AND status = 20
+    </update>
+
+    <!-- =====================================================================
+         findMetadataById: Worker 通过 artifactId 查询容器元数据（§15.1 末段）
+         仅返回 AVAILABLE(30) 的记录（下游读取前置条件，§16.2）
+         status/storage_type 通过 CASE 转换为枚举名，供 ResultMap 映射
+         ===================================================================== -->
+    <select id="findMetadataById" resultMap="ArtifactMetadataMap">
+        SELECT
+            id,
+            dag_instance_id,
+            node_id,
+            attempt_no,
+            format,
+            object_key,
+            checksum,
+            created_at,
+            CASE status
+                WHEN 10 THEN 'CREATING'
+                WHEN 20 THEN 'STAGED'
+                WHEN 30 THEN 'AVAILABLE'
+                WHEN 40 THEN 'ORPHANED'
+                WHEN 50 THEN 'DELETING'
+                WHEN 60 THEN 'DELETED'
+            END AS status_enum,
+            CASE
+                WHEN storage_type = 'OBJECT_STORAGE' THEN 'OBJECT_STORAGE'
+                WHEN storage_type = 'FILE_GDB' THEN 'FILE_GDB'
+                WHEN storage_type = 'POSTGIS' THEN 'POSTGIS'
+                ELSE NULL
+            END AS storage_type_enum
+        FROM sr_dag_artifact
+        WHERE id = #{artifactId}
+          AND status = 30
+    </select>
+
+    <!-- =====================================================================
+         scanOrphaned: 扫描 ORPHANED(40) 待回收 Artifact（§19.4）
+         按 updated_at 排序，优先回收最早进入 ORPHANED 的记录
+         ===================================================================== -->
+    <select id="scanOrphaned" resultType="java.lang.Long">
+        SELECT id
+        FROM sr_dag_artifact
+        WHERE status = 40
+          AND updated_at &lt; #{before}
+        ORDER BY updated_at ASC
+        LIMIT #{batchSize}
+    </select>
+
+    <!-- =====================================================================
+         markOrphanedAsDeleting: CAS ORPHANED(40) → DELETING(50)（§19.4）
+         ===================================================================== -->
+    <update id="markOrphanedAsDeleting">
+        UPDATE sr_dag_artifact
+        SET status = 50,
+            updated_at = #{now}
+        WHERE id = #{artifactId}
+          AND status = 40
+    </update>
+
+    <!-- =====================================================================
+         markDeletingAsDeleted: CAS DELETING(50) → DELETED(60)（§19.4）
+         ===================================================================== -->
+    <update id="markDeletingAsDeleted">
+        UPDATE sr_dag_artifact
+        SET status = 60,
+            updated_at = #{now}
+        WHERE id = #{artifactId}
+          AND status = 50
+    </update>
+
+</mapper>

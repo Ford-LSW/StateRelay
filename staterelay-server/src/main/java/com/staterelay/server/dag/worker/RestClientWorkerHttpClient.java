@@ -3,14 +3,18 @@ package com.staterelay.server.dag.worker;
 import com.staterelay.contract.protocol.RebindFenceRequest;
 import com.staterelay.contract.protocol.RebindFenceResponse;
 import com.staterelay.contract.protocol.RequestStatusResponse;
+import com.staterelay.contract.protocol.DispatchAck;
+import com.staterelay.contract.protocol.ExecuteTaskCommand;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.client.SimpleClientHttpRequestFactory;
 import org.springframework.http.MediaType;
 import org.springframework.stereotype.Component;
 import org.springframework.web.client.RestClient;
 import org.springframework.web.client.RestClientException;
 
+import java.net.URI;
 import java.time.Duration;
 
 /**
@@ -38,9 +42,32 @@ public class RestClientWorkerHttpClient implements WorkerHttpClient {
     public RestClientWorkerHttpClient(
             @Value("${staterelay.dag.worker-http.connect-timeout-ms:2000}") long connectTimeoutMs,
             @Value("${staterelay.dag.worker-http.read-timeout-ms:3000}") long readTimeoutMs) {
-        // 第一版用最简 RestClient 配置；如需精细超时可改用 RestClient.Builder + ClientHttpRequestFactory
+        SimpleClientHttpRequestFactory requestFactory = new SimpleClientHttpRequestFactory();
+        requestFactory.setConnectTimeout(Duration.ofMillis(connectTimeoutMs));
+        requestFactory.setReadTimeout(Duration.ofMillis(readTimeoutMs));
         this.restClient = RestClient.builder()
+                .requestFactory(requestFactory)
                 .build();
+    }
+
+    @Override
+    public DispatchAck execute(String workerAddress, ExecuteTaskCommand command) {
+        try {
+            return restClient.post()
+                    .uri(URI.create("http://" + workerAddress
+                            + "/staterelay/internal/v1/executions"))
+                    .contentType(MediaType.APPLICATION_JSON)
+                    .accept(MediaType.APPLICATION_JSON)
+                    .body(command)
+                    .retrieve()
+                    .body(DispatchAck.class);
+        } catch (RestClientException ex) {
+            log.warn("execute failed for worker={} requestId={}: {}",
+                    workerAddress, command.dispatchId(), ex.getMessage());
+            throw new WorkerHttpException(
+                    "POST /executions failed for worker=" + workerAddress
+                            + " requestId=" + command.dispatchId(), ex);
+        }
     }
 
     @Override

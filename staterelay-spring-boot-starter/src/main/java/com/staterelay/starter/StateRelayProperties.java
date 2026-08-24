@@ -20,6 +20,9 @@ public final class StateRelayProperties {
     private String host = "127.0.0.1";
     private String podName;
 
+    /** Worker 工作目录根路径（GIS-Worker 设计文档 §14.1） */
+    private String workBaseDirectory = "./work";
+
     public boolean isEnabled() {
         return enabled;
     }
@@ -106,6 +109,14 @@ public final class StateRelayProperties {
 
     public void setPodName(String podName) {
         this.podName = podName;
+    }
+
+    public String getWorkBaseDirectory() {
+        return workBaseDirectory;
+    }
+
+    public void setWorkBaseDirectory(String workBaseDirectory) {
+        this.workBaseDirectory = workBaseDirectory;
     }
 
     public enum Environment {

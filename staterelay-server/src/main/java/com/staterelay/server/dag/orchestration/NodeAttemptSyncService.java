@@ -12,6 +12,7 @@ import com.staterelay.server.dag.mapper.dto.NodeCompletionSnapshot;
 import com.staterelay.server.dag.repository.AlgorithmDefinitionRepository;
 import com.staterelay.server.dag.repository.NodeAttemptRepository;
 import com.staterelay.server.dag.repository.NodeInstanceJpaRepository;
+import com.staterelay.server.dag.service.SpatialArtifactService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
@@ -61,6 +62,7 @@ public class NodeAttemptSyncService {
     private final NodeAttemptRepository attemptRepository;
     private final NodeInstanceJpaRepository nodeInstanceRepository;
     private final AlgorithmDefinitionRepository algorithmDefinitionRepository;
+    private final SpatialArtifactService spatialArtifactService;
     private final TransactionTemplate transactions;
     private final int batchSize;
 
@@ -70,6 +72,7 @@ public class NodeAttemptSyncService {
                                    NodeAttemptRepository attemptRepository,
                                    NodeInstanceJpaRepository nodeInstanceRepository,
                                    AlgorithmDefinitionRepository algorithmDefinitionRepository,
+                                   SpatialArtifactService spatialArtifactService,
                                    TransactionTemplate transactions,
                                    @Value("${staterelay.dag.attempt-sync.batch-size:50}") int batchSize) {
         this.attemptMapper = attemptMapper;
@@ -78,6 +81,7 @@ public class NodeAttemptSyncService {
         this.attemptRepository = attemptRepository;
         this.nodeInstanceRepository = nodeInstanceRepository;
         this.algorithmDefinitionRepository = algorithmDefinitionRepository;
+        this.spatialArtifactService = spatialArtifactService;
         this.transactions = transactions;
         this.batchSize = batchSize;
     }
@@ -138,25 +142,44 @@ public class NodeAttemptSyncService {
     }
 
     /**
-     * 处理 SUCCESS（§29.1）：CAS NodeInstance RUNNING → SUCCESS；
-     * 同事务 +1 finished_node_count；写 Artifact 由业务层基于返回的快照补充。
+     * 处理 SUCCESS（§29.1 + GIS-Worker §16.2 围栏校验）：
+     * <ol>
+     *   <li>CAS NodeInstance RUNNING → SUCCESS，含 {@code current_attempt_no} 围栏校验</li>
+     *   <li>CAS 通过 → 当前权威 Attempt：批量推进 STAGED Artifact → AVAILABLE</li>
+     *   <li>CAS 失败 → 晚到 Attempt 或已被其他线程推进：批量标记 STAGED Artifact → ORPHANED</li>
+     *   <li>同事务 +1 finished_node_count；重置 schedule_fail_count</li>
+     * </ol>
      *
      * <p>同时重置 schedule_fail_count = 0（§9.1 重置时机之一：Worker 返回非容量拒绝 SUCCESS）。
      */
     private void applySuccess(NodeAttemptEntity attempt, NodeInstanceEntity node, Instant now) {
+        // §16.2 Attempt 围栏：current_attempt_no 必须匹配，防止晚到 Attempt 覆盖当前权威结果
         NodeCompletionSnapshot snapshot = nodeInstanceMapper.markSuccess(
             node.getId(),
+            attempt.getAttemptNo(),
             attempt.getResultJson(),
             attempt.getResultRef(),
             now);
         if (snapshot == null) {
-            log.debug("NodeInstance {} already finalized or not RUNNING", node.getId());
+            // CAS 失败：晚到 Attempt 或已被其他线程推进（§16.3）
+            // 将本 Attempt 的 STAGED Artifact 标记为 ORPHANED，等待清理回收
+            int orphaned = spatialArtifactService.orphanArtifactsForAttempt(
+                node.getDagInstanceId(), node.getNodeId(), attempt.getAttemptNo(), now);
+            if (orphaned > 0) {
+                log.info("Late attempt {} artifacts orphaned: node={}, attemptNo={}",
+                    attempt.getId(), node.getNodeId(), attempt.getAttemptNo());
+            }
+            log.debug("NodeInstance {} SUCCESS CAS failed (late attempt or already finalized)", node.getId());
             return;
         }
+        // CAS 通过：当前权威 Attempt，推进 STAGED Artifact → AVAILABLE（§16.2）
+        spatialArtifactService.promoteArtifactsForAttempt(
+            node.getDagInstanceId(), node.getNodeId(), attempt.getAttemptNo(), now);
         // 同事务 +1 finished_node_count（§39.1 T2）+ 重置 schedule_fail_count（§9.1）
         dagInstanceMapper.incrementFinishedCount(node.getDagInstanceId(), 1, now);
         nodeInstanceMapper.resetScheduleFailCount(node.getId(), now);
-        log.debug("NodeInstance {} SUCCESS via attempt {}", node.getId(), attempt.getId());
+        log.info("NodeInstance {} SUCCESS via attempt {} (attemptNo={}, artifacts promoted)",
+            node.getId(), attempt.getId(), attempt.getAttemptNo());
     }
 
     /**
@@ -176,6 +199,9 @@ public class NodeAttemptSyncService {
 
         if (node.getRetryCount() != null && node.getRetryCount() < maxRetry) {
             // 重试：CAS NodeInstance → READY，retry_count + 1（§29.2 / §29.3）
+            // 失败 Attempt 的 STAGED Artifact → ORPHANED（新 Attempt 会产出新成果）
+            spatialArtifactService.orphanArtifactsForAttempt(
+                node.getDagInstanceId(), node.getNodeId(), attempt.getAttemptNo(), now);
             Instant nextScheduleTime = now.plus(Duration.ofSeconds(retryIntervalSec));
             int updated = nodeInstanceMapper.revertToReady(node.getId(), nextScheduleTime, now);
             if (updated > 0) {
@@ -185,6 +211,9 @@ public class NodeAttemptSyncService {
             return;
         }
         // 终态：CAS NodeInstance → FAILED（§29.3）
+        // 失败 Attempt 的 STAGED Artifact → ORPHANED（§16.2 / §19.3）
+        spatialArtifactService.orphanArtifactsForAttempt(
+            node.getDagInstanceId(), node.getNodeId(), attempt.getAttemptNo(), now);
         int updated = nodeInstanceMapper.markFailed(
             node.getId(),
             attempt.getErrorCode(),
@@ -219,6 +248,9 @@ public class NodeAttemptSyncService {
 
         if (node.getRetryCount() != null && node.getRetryCount() < maxRetry) {
             // 重试：CAS NodeInstance → READY，retry_count + 1（§29.4）
+            // 超时 Attempt 的 STAGED Artifact → ORPHANED（新 Attempt 会产出新成果）
+            spatialArtifactService.orphanArtifactsForAttempt(
+                node.getDagInstanceId(), node.getNodeId(), attempt.getAttemptNo(), now);
             Instant nextScheduleTime = now.plus(Duration.ofSeconds(retryIntervalSec));
             int updated = nodeInstanceMapper.revertToReady(node.getId(), nextScheduleTime, now);
             if (updated > 0) {
@@ -228,6 +260,9 @@ public class NodeAttemptSyncService {
             return;
         }
         // 终态：CAS NodeInstance → TIMEOUT（§29.4）
+        // 超时 Attempt 的 STAGED Artifact → ORPHANED（§16.2 / §19.3）
+        spatialArtifactService.orphanArtifactsForAttempt(
+            node.getDagInstanceId(), node.getNodeId(), attempt.getAttemptNo(), now);
         String errorCode = attempt.getErrorCode() != null ? attempt.getErrorCode() : "TIMEOUT";
         String errorMessage = attempt.getErrorMessage() != null
             ? attempt.getErrorMessage()

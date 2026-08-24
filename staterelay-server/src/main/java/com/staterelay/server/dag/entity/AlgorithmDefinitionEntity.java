@@ -17,7 +17,7 @@ import java.time.Instant;
  * 算法定义（{@code sr_algorithm_definition}）。
  *
  * <p>表示系统具备的一种可调度能力。Scheduler 根据 {@code algorithmCode} 查到
- * {@code executorGroupCode}，再从 ExecutorRegistration 中选择存活 Worker。
+ * {@code executorGroupCode}，再从统一的 {@code sr_worker} 注册表中选择存活 Worker。
  *
  * <p><b>不可修改约束（对齐文档 §10）：</b>
  * 一旦 DagInstance 开始执行，本表行记录（包括 timeout_seconds / max_retry / retry_interval_seconds /
@@ -68,6 +68,20 @@ public class AlgorithmDefinitionEntity {
 
     @Column(name = "output_schema_json", columnDefinition = "jsonb")
     private String outputSchemaJson;
+
+    /**
+     * 契约版本号（§3.2）。Worker 心跳上报 contractVersion 供校验，
+     * 不一致时该 Worker 不得接收该算法的新任务 + 记录 ALGORITHM_CONTRACT_MISMATCH 告警。
+     */
+    @Column(name = "contract_version", nullable = false)
+    private String contractVersion = "1.0";
+
+    /**
+     * 契约 checksum（§3.2，contractVersion + inputs + outputs 序列化哈希）。
+     * 可空，空时校验降级为版本号匹配；非空时与 Worker 上报严格匹配。
+     */
+    @Column(name = "contract_checksum", length = 128)
+    private String contractChecksum;
 
     @Column(name = "status", nullable = false)
     @Convert(converter = AlgorithmDefinitionStatusConverter.class)

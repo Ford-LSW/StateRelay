@@ -88,6 +88,27 @@ public class NodeAttemptEntity {
     @Column(name = "worker_epoch", length = 64)
     private String workerEpoch;
 
+    @Column(name = "dispatch_generation")
+    private Long dispatchGeneration;
+
+    @Column(name = "dispatch_token", length = 128)
+    private String dispatchToken;
+
+    @Column(name = "capacity_released_at")
+    private Instant capacityReleasedAt;
+
+    @Column(name = "transport_generation", nullable = false)
+    private Long transportGeneration = 0L;
+
+    @Column(name = "transport_attempts", nullable = false)
+    private Integer transportAttempts = 0;
+
+    @Column(name = "next_dispatch_at")
+    private Instant nextDispatchAt;
+
+    @Column(name = "last_dispatch_error", columnDefinition = "TEXT")
+    private String lastDispatchError;
+
     /**
      * Attempt lease 围栏版本号（对齐文档 §19.1 / §44 / §47.1）。
      *

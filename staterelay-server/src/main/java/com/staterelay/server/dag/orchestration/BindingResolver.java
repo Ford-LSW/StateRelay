@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.staterelay.contract.dag.ArtifactRef;
 import com.staterelay.contract.dag.DagDefinition;
+import com.staterelay.contract.dag.binding.InputBinding;
 import com.staterelay.server.dag.entity.DagArtifactEntity;
 import com.staterelay.server.dag.entity.DagInstanceEntity;
 import com.staterelay.server.dag.mapper.DagEdgeMapper;
@@ -20,6 +21,16 @@ import java.util.Map;
  * 输入绑定解析器。
  *
  * <p>节点 WAITING → READY 时调用，将上游 ArtifactRef 解析为节点的 input_bindings_snapshot。
+ *
+ * <p><b>双协议并存（对齐 GIS-Worker 设计文档 §6）：</b>
+ * <ul>
+ *   <li>旧协议（{@link DagDefinition.DagNode#getInputs()}）：静态值 + ${} 表达式，本类直接解析并冻结为最终值</li>
+ *   <li>新协议（{@link DagDefinition.DagNode#getInputBindings()}）：结构化 {@link InputBinding}，
+ *       本类将 InputBinding Map 原样冻结为 snapshot JSON，<b>不</b>在此阶段解析 Artifact 引用 ——
+ *       NODE_OUTPUT 解析推迟到 ParameterResolver DISPATCHING 阶段，此时上游 Artifact 已 AVAILABLE</li>
+ * </ul>
+ *
+ * <p>旧协议路径：
  * <ul>
  *   <li>静态绑定（直接 value）：直接保留</li>
  *   <li>DAG 输入引用（${dag.inputs.xxx}）：从 instance.input_json 取值</li>
@@ -49,10 +60,26 @@ public class BindingResolver {
 
     /**
      * 解析节点输入绑定，输出可直接写入 input_bindings_snapshot 的 JSON。
+     *
+     * <p>自动根据节点配置选择协议路径：
+     * <ul>
+     *   <li>{@link DagDefinition.DagNode#getInputBindings()} 非空 → 走新协议，原样冻结 InputBinding Map</li>
+     *   <li>否则走旧协议，解析 ${} 表达式</li>
+     * </ul>
      */
     public String resolveBindings(DagInstanceEntity instance,
                                   DagDefinitionVersionLite versionLite,
                                   DagDefinition.DagNode node) {
+        // 新协议分支：InputBinding Map 原样冻结，由 ParameterResolver 在 DISPATCHING 时解析
+        Map<String, InputBinding> inputBindings = node.getInputBindings();
+        if (inputBindings != null && !inputBindings.isEmpty()) {
+            try {
+                return objectMapper.writeValueAsString(inputBindings);
+            } catch (JsonProcessingException e) {
+                throw new IllegalStateException("Failed to serialize inputBindings snapshot", e);
+            }
+        }
+        // 旧协议分支：${} 表达式 + 静态值
         Map<String, Object> resolved = new HashMap<>();
         Map<String, Object> inputs = node.getInputs();
         if (inputs != null) {

@@ -3,7 +3,10 @@ package com.staterelay.server.dag.service;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.staterelay.contract.dag.DagDefinition;
+import com.staterelay.contract.dag.algorithm.AlgorithmContract;
+import com.staterelay.contract.dag.enums.AlgorithmDefinitionStatus;
 import com.staterelay.contract.dag.enums.DagDefinitionVersionStatus;
+import com.staterelay.server.dag.entity.AlgorithmDefinitionEntity;
 import com.staterelay.server.dag.entity.DagDefinitionEntity;
 import com.staterelay.server.dag.entity.DagDefinitionVersionEntity;
 import com.staterelay.server.dag.entity.DagEdgeEntity;
@@ -11,6 +14,7 @@ import com.staterelay.server.dag.mapper.DagEdgeMapper;
 import com.staterelay.server.dag.repository.DagDefinitionRepository;
 import com.staterelay.server.dag.repository.DagDefinitionVersionRepository;
 import com.staterelay.server.dag.repository.DagEdgeRepository;
+import com.staterelay.server.dag.repository.AlgorithmDefinitionRepository;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -18,9 +22,10 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.time.Instant;
-import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.HexFormat;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 /**
@@ -38,19 +43,25 @@ public class DagDefinitionService {
     private final DagEdgeMapper edgeMapper;
     private final DagDefinitionValidator validator;
     private final ObjectMapper objectMapper;
+    private final AlgorithmDefinitionRepository algorithmDefinitionRepository;
+    private final AlgorithmContractAdapter algorithmContractAdapter;
 
     public DagDefinitionService(DagDefinitionRepository definitionRepository,
                                 DagDefinitionVersionRepository versionRepository,
                                 DagEdgeRepository edgeRepository,
                                 DagEdgeMapper edgeMapper,
                                 DagDefinitionValidator validator,
-                                ObjectMapper objectMapper) {
+                                ObjectMapper objectMapper,
+                                AlgorithmDefinitionRepository algorithmDefinitionRepository,
+                                AlgorithmContractAdapter algorithmContractAdapter) {
         this.definitionRepository = definitionRepository;
         this.versionRepository = versionRepository;
         this.edgeRepository = edgeRepository;
         this.edgeMapper = edgeMapper;
         this.validator = validator;
         this.objectMapper = objectMapper;
+        this.algorithmDefinitionRepository = algorithmDefinitionRepository;
+        this.algorithmContractAdapter = algorithmContractAdapter;
     }
 
     /**
@@ -110,8 +121,10 @@ public class DagDefinitionService {
         if (!VERSION_STATUS_DRAFT.equals(version.getStatus())) {
             throw new IllegalStateException("Only DRAFT version can be published");
         }
-        // 发布前强制拓扑校验，失败抛 IllegalArgumentException，状态保持 DRAFT
-        validator.validate(loadSnapshot(version));
+        // 发布前强制拓扑与结构化绑定校验，失败抛 IllegalArgumentException，状态保持 DRAFT
+        DagDefinition snapshot = loadSnapshot(version);
+        validator.validate(snapshot);
+        validator.validateInputBindings(snapshot, loadAlgorithmContracts(snapshot));
         version.setStatus(VERSION_STATUS_ENABLED);
         version.setPublishedAt(Instant.now());
         version.setUpdatedAt(Instant.now());
@@ -160,6 +173,22 @@ public class DagDefinitionService {
 
     public List<DagEdgeEntity> findEdges(Long dagDefinitionVersionId) {
         return edgeRepository.findByDagDefinitionVersionId(dagDefinitionVersionId);
+    }
+
+    private Map<String, AlgorithmContract> loadAlgorithmContracts(DagDefinition snapshot) {
+        Map<String, AlgorithmContract> contracts = new LinkedHashMap<>();
+        for (DagDefinition.DagNode node : snapshot.getNodes()) {
+            String algorithmCode = node.getAlgorithmCode();
+            if (algorithmCode == null || algorithmCode.isBlank() || contracts.containsKey(algorithmCode)) {
+                continue;
+            }
+            AlgorithmDefinitionEntity definition = algorithmDefinitionRepository
+                .findByAlgorithmCodeAndStatus(algorithmCode, AlgorithmDefinitionStatus.ENABLED)
+                .orElseThrow(() -> new IllegalArgumentException(
+                    "Enabled algorithm definition not found: " + algorithmCode));
+            contracts.put(algorithmCode, algorithmContractAdapter.toContract(definition));
+        }
+        return contracts;
     }
 
     private Integer nextVersionNo(Long dagDefinitionId) {
