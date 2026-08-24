@@ -38,6 +38,7 @@ public final class DefaultAlgorithmExecutionContext implements AlgorithmExecutio
     private final WorkDirectory workDirectory;
     private final ArtifactClient artifactClient;
     private final ArtifactMetadataClient artifactMetadataClient;
+    private final RequestIdStore requestIdStore;
 
     public DefaultAlgorithmExecutionContext(
             ExecuteTaskCommand command,
@@ -46,7 +47,8 @@ public final class DefaultAlgorithmExecutionContext implements AlgorithmExecutio
             Clock clock,
             WorkDirectory workDirectory,
             ArtifactClient artifactClient,
-            ArtifactMetadataClient artifactMetadataClient) {
+            ArtifactMetadataClient artifactMetadataClient,
+            RequestIdStore requestIdStore) {
         this.command = Objects.requireNonNull(command, "command");
         this.identity = Objects.requireNonNull(identity, "identity");
         this.reporter = Objects.requireNonNull(reporter, "reporter");
@@ -55,11 +57,12 @@ public final class DefaultAlgorithmExecutionContext implements AlgorithmExecutio
         this.workDirectory = workDirectory;
         this.artifactClient = artifactClient;
         this.artifactMetadataClient = artifactMetadataClient;
+        this.requestIdStore = Objects.requireNonNull(requestIdStore, "requestIdStore");
     }
 
     @Override
     public WorkerExecutionContext executionContext() {
-        return executionContext;
+        return latestExecutionContext();
     }
 
     @Override
@@ -91,7 +94,9 @@ public final class DefaultAlgorithmExecutionContext implements AlgorithmExecutio
 
     @Override
     public long leaseVersion() {
-        return command.leaseVersion();
+        return requestIdStore.find(executionContext.getRequestId())
+                .map(RequestIdStore.RequestIdRecord::leaseVersion)
+                .orElse(command.leaseVersion());
     }
 
     @Override
@@ -106,9 +111,38 @@ public final class DefaultAlgorithmExecutionContext implements AlgorithmExecutio
 
     @Override
     public void reportProgress(int percent, String message) {
+        WorkerExecutionContext latest = latestExecutionContext();
         reporter.reportProgress(new TaskProgressReport(
-                command.taskInstanceId(), command.attemptId(), command.leaseVersion(),
-                identity.workerId().toString(), identity.workerEpoch().toString(),
-                percent, message, clock.instant()));
+                command.taskInstanceId(), command.attemptId(), latest.getAttemptLeaseVersion(),
+                latest.getWorkerId(), latest.getWorkerEpoch(),
+                percent, message, clock.instant(), latest));
+    }
+
+    private WorkerExecutionContext latestExecutionContext() {
+        WorkerExecutionContext latest = copy(executionContext);
+        requestIdStore.find(executionContext.getRequestId()).ifPresent(record -> {
+            latest.setRequestChecksum(record.requestChecksum());
+            latest.setAttemptLeaseVersion(record.leaseVersion());
+            latest.setWorkerId(record.workerId());
+            latest.setWorkerEpoch(record.workerEpoch());
+        });
+        return latest;
+    }
+
+    private static WorkerExecutionContext copy(WorkerExecutionContext source) {
+        WorkerExecutionContext copy = new WorkerExecutionContext();
+        copy.setDagInstanceId(source.getDagInstanceId());
+        copy.setNodeInstanceId(source.getNodeInstanceId());
+        copy.setNodeCode(source.getNodeCode());
+        copy.setAttemptId(source.getAttemptId());
+        copy.setAttemptNo(source.getAttemptNo());
+        copy.setRequestId(source.getRequestId());
+        copy.setRequestChecksum(source.getRequestChecksum());
+        copy.setDispatchGeneration(source.getDispatchGeneration());
+        copy.setDispatchToken(source.getDispatchToken());
+        copy.setAttemptLeaseVersion(source.getAttemptLeaseVersion());
+        copy.setWorkerId(source.getWorkerId());
+        copy.setWorkerEpoch(source.getWorkerEpoch());
+        return copy;
     }
 }

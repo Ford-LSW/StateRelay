@@ -1,6 +1,8 @@
 package com.staterelay.server.dag.dispatch;
 
 import com.staterelay.contract.protocol.DispatchAck;
+import lombok.AllArgsConstructor;
+import lombok.Data;
 import org.springframework.jdbc.core.namedparam.MapSqlParameterSource;
 import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate;
 import org.springframework.stereotype.Repository;
@@ -18,7 +20,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
 
-/** PostgreSQL-backed implementation of the unified DAG dispatch store. */
+/** 基于 PostgreSQL 的统一 DAG 调度存储实现。 */
 @Repository
 public class JdbcDagDispatchStore implements DagDispatchStore {
 
@@ -49,8 +51,8 @@ public class JdbcDagDispatchStore implements DagDispatchStore {
                   AND dag.status = 10
                 FOR UPDATE OF node
                 """, new MapSqlParameterSource()
-                .addValue("nodeInstanceId", request.nodeInstanceId())
-                .addValue("dagInstanceId", request.dagInstanceId()),
+                .addValue("nodeInstanceId", request.getNodeInstanceId())
+                .addValue("dagInstanceId", request.getDagInstanceId()),
                 (resultSet, rowNumber) -> new NodeFence(
                         resultSet.getObject("current_attempt_id", Long.class),
                         resultSet.getObject("dispatch_generation", Long.class),
@@ -59,8 +61,8 @@ public class JdbcDagDispatchStore implements DagDispatchStore {
             return Optional.empty();
         }
         NodeFence fence = fences.get(0);
-        if (fence.currentAttemptId() != null) {
-            Optional<Assignment> existing = findCurrentUncertain(request, fence.currentAttemptId());
+        if (fence.getCurrentAttemptId() != null) {
+            Optional<Assignment> existing = findCurrentUncertain(request, fence.getCurrentAttemptId());
             if (existing.isPresent()) {
                 return existing;
             }
@@ -81,8 +83,8 @@ public class JdbcDagDispatchStore implements DagDispatchStore {
                   AND lease_expires_at > clock_timestamp()
                   AND GREATEST(reserved_capacity, reported_active_count) < max_concurrency
                 """, new MapSqlParameterSource()
-                .addValue("workerId", worker.workerId())
-                .addValue("workerEpoch", worker.workerEpoch()));
+                    .addValue("workerId", worker.getWorkerId())
+                    .addValue("workerEpoch", worker.getWorkerEpoch()));
         if (reserved != 1) {
             return Optional.empty();
         }
@@ -91,14 +93,14 @@ public class JdbcDagDispatchStore implements DagDispatchStore {
                 SELECT COALESCE(MAX(attempt_no), 0) + 1
                 FROM sr_dag_node_attempt
                 WHERE node_instance_id = :nodeInstanceId
-                """, new MapSqlParameterSource("nodeInstanceId", request.nodeInstanceId()),
+                """, new MapSqlParameterSource("nodeInstanceId", request.getNodeInstanceId()),
                 Integer.class);
-        long dispatchGeneration = fence.dispatchGeneration() == null
-                ? 1L : fence.dispatchGeneration() + 1L;
+        long dispatchGeneration = fence.getDispatchGeneration() == null
+                ? 1L : fence.getDispatchGeneration() + 1L;
         String dispatchToken = UUID.randomUUID().toString();
         String requestId = UUID.randomUUID().toString();
-        Instant leaseExpiresAt = now.plus(request.attemptLease());
-        Instant executionDeadlineAt = now.plus(request.executionTimeout());
+        Instant leaseExpiresAt = now.plus(request.getAttemptLease());
+        Instant executionDeadlineAt = now.plus(request.getExecutionTimeout());
         Long attemptId = jdbc.queryForObject("""
                 INSERT INTO sr_dag_node_attempt(
                     dag_instance_id, node_instance_id, attempt_no, request_id, request_checksum,
@@ -113,16 +115,16 @@ public class JdbcDagDispatchStore implements DagDispatchStore {
                     :dispatchGeneration, :dispatchToken, 0, 0, :now, :now, :now, :now)
                 RETURNING id
                 """, new MapSqlParameterSource()
-                .addValue("dagInstanceId", request.dagInstanceId())
-                .addValue("nodeInstanceId", request.nodeInstanceId())
+                .addValue("dagInstanceId", request.getDagInstanceId())
+                .addValue("nodeInstanceId", request.getNodeInstanceId())
                 .addValue("attemptNo", attemptNo)
                 .addValue("requestId", requestId)
-                .addValue("requestChecksum", request.requestChecksum())
-                .addValue("executionCode", request.executionCode())
-                .addValue("workerIdText", worker.workerId().toString())
-                .addValue("workerAddress", worker.address())
-                .addValue("workerEpochText", worker.workerEpoch().toString())
-                .addValue("requestJson", request.requestJson())
+                .addValue("requestChecksum", request.getRequestChecksum())
+                .addValue("executionCode", request.getExecutionCode())
+                .addValue("workerIdText", worker.getWorkerId().toString())
+                .addValue("workerAddress", worker.getAddress())
+                .addValue("workerEpochText", worker.getWorkerEpoch().toString())
+                .addValue("requestJson", request.getRequestJson())
                 .addValue("leaseExpiresAt", timestamp(leaseExpiresAt), Types.TIMESTAMP_WITH_TIMEZONE)
                 .addValue("executionDeadlineAt", timestamp(executionDeadlineAt), Types.TIMESTAMP_WITH_TIMEZONE)
                 .addValue("dispatchGeneration", dispatchGeneration)
@@ -145,17 +147,17 @@ public class JdbcDagDispatchStore implements DagDispatchStore {
                 .addValue("dispatchGeneration", dispatchGeneration)
                 .addValue("dispatchToken", dispatchToken)
                 .addValue("now", timestamp(now), Types.TIMESTAMP_WITH_TIMEZONE)
-                .addValue("nodeInstanceId", request.nodeInstanceId())
-                .addValue("dagInstanceId", request.dagInstanceId()));
+                .addValue("nodeInstanceId", request.getNodeInstanceId())
+                .addValue("dagInstanceId", request.getDagInstanceId()));
         if (fenced != 1) {
             throw new IllegalStateException("Node current-attempt fence changed during reservation");
         }
         return Optional.of(new Assignment(
-                request.dagInstanceId(), request.nodeInstanceId(), request.nodeCode(), attemptId,
-                attemptNo, requestId, request.requestChecksum(), dispatchGeneration,
-                dispatchToken, 1L, worker.workerId().toString(), worker.workerEpoch().toString(),
-                worker.address(), request.executorGroupCode(), request.executionCode(),
-                request.requestJson(), request.attemptLease(), now));
+                request.getDagInstanceId(), request.getNodeInstanceId(), request.getNodeCode(), attemptId,
+                attemptNo, requestId, request.getRequestChecksum(), dispatchGeneration,
+                dispatchToken, 1L, worker.getWorkerId().toString(), worker.getWorkerEpoch().toString(),
+                worker.getAddress(), request.getExecutorGroupCode(), request.getExecutionCode(),
+                request.getRequestJson(), request.getAttemptLease(), now));
     }
 
     private Optional<Assignment> findCurrentUncertain(
@@ -174,11 +176,11 @@ public class JdbcDagDispatchStore implements DagDispatchStore {
                   AND node.dispatch_token = attempt.dispatch_token
                 """, new MapSqlParameterSource()
                 .addValue("attemptId", currentAttemptId)
-                .addValue("nodeInstanceId", request.nodeInstanceId())
-                .addValue("dagInstanceId", request.dagInstanceId())
-                .addValue("requestChecksum", request.requestChecksum()),
+                .addValue("nodeInstanceId", request.getNodeInstanceId())
+                .addValue("dagInstanceId", request.getDagInstanceId())
+                .addValue("requestChecksum", request.getRequestChecksum()),
                 (resultSet, rowNumber) -> assignment(
-                        resultSet, request.executorGroupCode(), request.attemptLease()));
+                        resultSet, request.getExecutorGroupCode(), request.getAttemptLease()));
         return assignments.stream().findFirst();
     }
 
@@ -211,12 +213,12 @@ public class JdbcDagDispatchStore implements DagDispatchStore {
                 LIMIT 1
                 FOR UPDATE OF worker SKIP LOCKED
                 """, new MapSqlParameterSource()
-                .addValue("executorGroupCode", request.executorGroupCode())
-                .addValue("algorithmProtocol", request.algorithmProtocol())
-                .addValue("executionCode", request.executionCode())
-                .addValue("contractVersion", request.contractVersion())
-                .addValue("requiresChecksum", hasText(request.contractChecksum()))
-                .addValue("contractChecksum", request.contractChecksum()),
+                .addValue("executorGroupCode", request.getExecutorGroupCode())
+                .addValue("algorithmProtocol", request.isAlgorithmProtocol())
+                .addValue("executionCode", request.getExecutionCode())
+                .addValue("contractVersion", request.getContractVersion())
+                .addValue("requiresChecksum", hasText(request.getContractChecksum()))
+                .addValue("contractChecksum", request.getContractChecksum()),
                 (resultSet, rowNumber) -> {
                     String host = resultSet.getString("host");
                     if (host.contains(":")) {
@@ -269,11 +271,11 @@ public class JdbcDagDispatchStore implements DagDispatchStore {
                         AND dag.status = 10)
                 RETURNING transport_generation
                 """, sendFence(candidate)
-                .addValue("dagInstanceId", candidate.dagInstanceId())
-                .addValue("nodeInstanceId", candidate.nodeInstanceId())
-                .addValue("attemptNo", candidate.attemptNo())
-                .addValue("requestChecksum", candidate.requestChecksum())
-                .addValue("attemptLeaseVersion", candidate.attemptLeaseVersion())
+                .addValue("dagInstanceId", candidate.getDagInstanceId())
+                .addValue("nodeInstanceId", candidate.getNodeInstanceId())
+                .addValue("attemptNo", candidate.getAttemptNo())
+                .addValue("requestChecksum", candidate.getRequestChecksum())
+                .addValue("attemptLeaseVersion", candidate.getAttemptLeaseVersion())
                 .addValue("now", timestamp(now), Types.TIMESTAMP_WITH_TIMEZONE)
                 .addValue("leaseExpiresAt", timestamp(leaseExpiresAt), Types.TIMESTAMP_WITH_TIMEZONE),
                 (resultSet, rowNumber) -> resultSet.getLong("transport_generation"))));
@@ -283,7 +285,7 @@ public class JdbcDagDispatchStore implements DagDispatchStore {
     @Override
     public boolean markAccepted(SendClaim claim, Instant now) {
         return Boolean.TRUE.equals(transactions.execute(status -> {
-            Assignment assignment = claim.assignment();
+            Assignment assignment = claim.getAssignment();
             int accepted = jdbc.update("""
                     UPDATE sr_dag_node_attempt
                     SET accepted_at = COALESCE(accepted_at, :now),
@@ -320,9 +322,9 @@ public class JdbcDagDispatchStore implements DagDispatchStore {
                           SELECT 1 FROM sr_dag_instance dag
                           WHERE dag.id = node.dag_instance_id AND dag.status = 10)
                     """, sendFence(assignment)
-                    .addValue("dagInstanceId", assignment.dagInstanceId())
-                    .addValue("nodeInstanceId", assignment.nodeInstanceId())
-                    .addValue("attemptNo", assignment.attemptNo())
+                .addValue("dagInstanceId", assignment.getDagInstanceId())
+                .addValue("nodeInstanceId", assignment.getNodeInstanceId())
+                .addValue("attemptNo", assignment.getAttemptNo())
                     .addValue("now", timestamp(now), Types.TIMESTAMP_WITH_TIMEZONE));
             if (running != 1) {
                 status.setRollbackOnly();
@@ -340,14 +342,14 @@ public class JdbcDagDispatchStore implements DagDispatchStore {
             Instant now,
             Instant nextScheduleTime) {
         return Boolean.TRUE.equals(transactions.execute(status -> {
-            Assignment assignment = claim.assignment();
+            Assignment assignment = claim.getAssignment();
             MapSqlParameterSource rejectionFence = sendFence(assignment)
-                    .addValue("dagInstanceId", assignment.dagInstanceId())
-                    .addValue("nodeInstanceId", assignment.nodeInstanceId())
-                    .addValue("attemptNo", assignment.attemptNo())
-                    .addValue("requestChecksum", assignment.requestChecksum())
-                    .addValue("attemptLeaseVersion", assignment.attemptLeaseVersion())
-                    .addValue("transportGeneration", claim.transportGeneration());
+                .addValue("dagInstanceId", assignment.getDagInstanceId())
+                .addValue("nodeInstanceId", assignment.getNodeInstanceId())
+                .addValue("attemptNo", assignment.getAttemptNo())
+                .addValue("requestChecksum", assignment.getRequestChecksum())
+                .addValue("attemptLeaseVersion", assignment.getAttemptLeaseVersion())
+                .addValue("transportGeneration", claim.getTransportGeneration());
             List<Boolean> releases = jdbc.query("""
                     SELECT attempt.capacity_released_at IS NULL AS release_required
                     FROM sr_dag_node_attempt attempt
@@ -418,9 +420,9 @@ public class JdbcDagDispatchStore implements DagDispatchStore {
                           SELECT 1 FROM sr_dag_instance dag
                           WHERE dag.id = node.dag_instance_id AND dag.status = 10)
                     """, sendFence(assignment)
-                    .addValue("dagInstanceId", assignment.dagInstanceId())
-                    .addValue("nodeInstanceId", assignment.nodeInstanceId())
-                    .addValue("attemptNo", assignment.attemptNo())
+                .addValue("dagInstanceId", assignment.getDagInstanceId())
+                .addValue("nodeInstanceId", assignment.getNodeInstanceId())
+                .addValue("attemptNo", assignment.getAttemptNo())
                     .addValue("errorCode", "DISPATCH_" + ackStatus.name())
                     .addValue("errorMessage", message)
                     .addValue("nextScheduleTime", timestamp(nextScheduleTime), Types.TIMESTAMP_WITH_TIMEZONE)
@@ -431,8 +433,8 @@ public class JdbcDagDispatchStore implements DagDispatchStore {
                         updated_at = clock_timestamp()
                     WHERE id = :workerId AND worker_epoch = :workerEpoch
                     """, new MapSqlParameterSource()
-                    .addValue("workerId", UUID.fromString(assignment.workerId()))
-                    .addValue("workerEpoch", UUID.fromString(assignment.workerEpoch()))) : 1;
+                    .addValue("workerId", UUID.fromString(assignment.getWorkerId()))
+                    .addValue("workerEpoch", UUID.fromString(assignment.getWorkerEpoch()))) : 1;
             if (failed != 1 || released != 1) {
                 status.setRollbackOnly();
                 return false;
@@ -443,7 +445,7 @@ public class JdbcDagDispatchStore implements DagDispatchStore {
 
     @Override
     public boolean markUncertain(SendClaim claim, String error, Instant nextTransportAt) {
-        Assignment assignment = claim.assignment();
+        Assignment assignment = claim.getAssignment();
         return Boolean.TRUE.equals(transactions.execute(status -> jdbc.update("""
                 UPDATE sr_dag_node_attempt
                 SET last_dispatch_error = :error,
@@ -459,7 +461,7 @@ public class JdbcDagDispatchStore implements DagDispatchStore {
                   AND transport_generation = :transportGeneration
                   AND next_dispatch_at IS NOT NULL
                 """, sendFence(assignment)
-                .addValue("transportGeneration", claim.transportGeneration())
+                .addValue("transportGeneration", claim.getTransportGeneration())
                 .addValue("error", error)
                 .addValue("nextTransportAt", timestamp(nextTransportAt), Types.TIMESTAMP_WITH_TIMEZONE)) == 1));
     }
@@ -515,12 +517,12 @@ public class JdbcDagDispatchStore implements DagDispatchStore {
 
     private MapSqlParameterSource sendFence(Assignment assignment) {
         return new MapSqlParameterSource()
-                .addValue("attemptId", assignment.attemptId())
-                .addValue("requestId", assignment.requestId())
-                .addValue("dispatchGeneration", assignment.dispatchGeneration())
-                .addValue("dispatchToken", assignment.dispatchToken())
-                .addValue("workerId", assignment.workerId())
-                .addValue("workerEpoch", assignment.workerEpoch());
+                .addValue("attemptId", assignment.getAttemptId())
+                .addValue("requestId", assignment.getRequestId())
+                .addValue("dispatchGeneration", assignment.getDispatchGeneration())
+                .addValue("dispatchToken", assignment.getDispatchToken())
+                .addValue("workerId", assignment.getWorkerId())
+                .addValue("workerEpoch", assignment.getWorkerEpoch());
     }
 
     private static boolean hasText(String value) {
@@ -536,9 +538,19 @@ public class JdbcDagDispatchStore implements DagDispatchStore {
         return value == null ? null : value.toInstant();
     }
 
-    private record NodeFence(Long currentAttemptId, Long dispatchGeneration, String dispatchToken) {
+    @Data
+    @AllArgsConstructor
+    private static class NodeFence {
+        private final Long currentAttemptId;
+        private final Long dispatchGeneration;
+        private final String dispatchToken;
     }
 
-    private record Worker(UUID workerId, UUID workerEpoch, String address) {
+    @Data
+    @AllArgsConstructor
+    private static class Worker {
+        private final UUID workerId;
+        private final UUID workerEpoch;
+        private final String address;
     }
 }

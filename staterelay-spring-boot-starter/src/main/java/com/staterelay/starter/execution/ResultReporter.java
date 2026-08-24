@@ -2,6 +2,7 @@ package com.staterelay.starter.execution;
 
 import com.staterelay.contract.protocol.TaskProgressReport;
 import com.staterelay.contract.protocol.TaskResultReport;
+import com.staterelay.contract.dag.algorithm.WorkerExecutionContext;
 import org.springframework.scheduling.TaskScheduler;
 import org.springframework.web.client.RestClient;
 
@@ -25,6 +26,7 @@ public final class ResultReporter implements AutoCloseable {
     private final Duration retryInitial;
     private final Duration retryMaximum;
     private final Duration terminalRetention;
+    private final RequestIdStore requestIdStore;
     private final Map<String, ProgressState> progress = new ConcurrentHashMap<>();
     private final Object terminalDeliveryLock = new Object();
     private volatile TaskScheduler scheduler;
@@ -39,6 +41,19 @@ public final class ResultReporter implements AutoCloseable {
             Duration retryInitial,
             Duration retryMaximum,
             Duration terminalRetention) {
+        this(store, transport, clock, progressInterval, retryInitial, retryMaximum,
+                terminalRetention, null);
+    }
+
+    public ResultReporter(
+            LocalDispatchStore store,
+            Transport transport,
+            Clock clock,
+            Duration progressInterval,
+            Duration retryInitial,
+            Duration retryMaximum,
+            Duration terminalRetention,
+            RequestIdStore requestIdStore) {
         this.store = Objects.requireNonNull(store, "store");
         this.transport = Objects.requireNonNull(transport, "transport");
         this.clock = Objects.requireNonNull(clock, "clock");
@@ -52,6 +67,7 @@ public final class ResultReporter implements AutoCloseable {
             throw new IllegalArgumentException("terminalRetention must not be negative");
         }
         this.terminalRetention = terminalRetention;
+        this.requestIdStore = requestIdStore;
     }
 
     public void start(TaskScheduler scheduler) {
@@ -68,12 +84,16 @@ public final class ResultReporter implements AutoCloseable {
             retryPendingTerminals();
             pruneAcknowledgedTerminals();
         }), retryInitial);
-        runSafely(this::retryPendingTerminals);
+        try {
+            scheduler.schedule(() -> runSafely(this::retryPendingTerminals), clock.instant());
+        } catch (RuntimeException ignored) {
+            // 即时恢复无法入队时，周期重试任务仍是最终兜底。
+        }
     }
 
     public void reportProgress(TaskProgressReport report) {
         Objects.requireNonNull(report, "report");
-        ProgressState state = progress.computeIfAbsent(report.attemptId(), ignored ->
+        ProgressState state = progress.computeIfAbsent(report.getAttemptId(), ignored ->
                 new ProgressState());
         TaskProgressReport outbound = null;
         Instant now = clock.instant();
@@ -125,7 +145,26 @@ public final class ResultReporter implements AutoCloseable {
             currentScheduler.schedule(
                     () -> runSafely(() -> deliverSerialized(dispatchId)), clock.instant());
         } catch (RuntimeException ignored) {
-            // The durable due record remains available to the periodic retry task.
+            // 持久化到期记录仍可由周期重试任务处理。
+        }
+    }
+
+    /**
+     * 重新上报从 RequestIdStore 恢复的终态记录。
+     *
+     * <p>RequestIdStore 始终是持久化权威来源；发送失败后可在调度器重发同一 requestId 时重试。
+     */
+    public void reportRecoveredTerminal(TaskResultReport report) {
+        Objects.requireNonNull(report, "report");
+        TaskScheduler currentScheduler = scheduler;
+        if (currentScheduler == null) {
+            sendRecovered(report);
+            return;
+        }
+        try {
+            currentScheduler.schedule(() -> runSafely(() -> sendRecovered(report)), clock.instant());
+        } catch (RuntimeException ignored) {
+            // 下次重发时会再次上报 RequestIdStore 中的持久化记录。
         }
     }
 
@@ -154,6 +193,9 @@ public final class ResultReporter implements AutoCloseable {
         if (currentTerminalTask != null) {
             currentTerminalTask.cancel(false);
         }
+        synchronized (terminalDeliveryLock) {
+            // 在持久化存储关闭前等待已开始的发送完成。
+        }
     }
 
     private void sendProgress(ProgressState state, TaskProgressReport report) {
@@ -165,6 +207,14 @@ public final class ResultReporter implements AutoCloseable {
                     state.pending = report;
                 }
             }
+        }
+    }
+
+    private void sendRecovered(TaskResultReport report) {
+        try {
+            transport.sendTerminal(latestTerminalReport(report));
+        } catch (Exception ignored) {
+            // 终态仍持久化在 RequestIdStore 中。
         }
     }
 
@@ -181,9 +231,9 @@ public final class ResultReporter implements AutoCloseable {
         }
         boolean acknowledged = false;
         try {
-            acknowledged = transport.sendTerminal(record.terminalReport());
+            acknowledged = transport.sendTerminal(latestTerminalReport(record.terminalReport()));
         } catch (Exception ignored) {
-            // The complete report remains durable and will be retried.
+            // 完整报告保持持久化，后续继续重试。
         }
         Instant now = clock.instant();
         if (acknowledged) {
@@ -192,6 +242,46 @@ public final class ResultReporter implements AutoCloseable {
             store.recordTerminalDeliveryFailure(
                     record.dispatchId(), now.plus(retryDelay(record.terminalDeliveryAttempts())));
         }
+    }
+
+    private TaskResultReport latestTerminalReport(TaskResultReport report) {
+        WorkerExecutionContext source = report.getExecutionContext();
+        if (requestIdStore == null || source == null) {
+            return report;
+        }
+        RequestIdStore.RequestIdRecord record = requestIdStore.find(source.getRequestId())
+                .orElseThrow(() -> new IllegalStateException(
+                        "requestId terminal fence is unavailable: " + source.getRequestId()));
+        if (!Objects.equals(record.attemptId(), Long.valueOf(source.getAttemptId()))) {
+            throw new IllegalStateException("requestId terminal attempt fence mismatch");
+        }
+        WorkerExecutionContext latest = copyContext(source);
+        latest.setRequestChecksum(record.requestChecksum());
+        latest.setAttemptLeaseVersion(record.leaseVersion());
+        latest.setWorkerId(record.workerId());
+        latest.setWorkerEpoch(record.workerEpoch());
+        return new TaskResultReport(
+                report.getTaskInstanceId(), report.getAttemptId(), record.leaseVersion(),
+                record.workerId(), record.workerEpoch(), report.getTerminalStatus(),
+                report.getResult(), report.getErrorCode(), report.getErrorMessage(),
+                report.getStartedAt(), report.getFinishedAt(), latest);
+    }
+
+    private static WorkerExecutionContext copyContext(WorkerExecutionContext source) {
+        WorkerExecutionContext copy = new WorkerExecutionContext();
+        copy.setDagInstanceId(source.getDagInstanceId());
+        copy.setNodeInstanceId(source.getNodeInstanceId());
+        copy.setNodeCode(source.getNodeCode());
+        copy.setAttemptId(source.getAttemptId());
+        copy.setAttemptNo(source.getAttemptNo());
+        copy.setRequestId(source.getRequestId());
+        copy.setRequestChecksum(source.getRequestChecksum());
+        copy.setDispatchGeneration(source.getDispatchGeneration());
+        copy.setDispatchToken(source.getDispatchToken());
+        copy.setAttemptLeaseVersion(source.getAttemptLeaseVersion());
+        copy.setWorkerId(source.getWorkerId());
+        copy.setWorkerEpoch(source.getWorkerEpoch());
+        return copy;
     }
 
     private Duration retryDelay(int completedFailures) {
@@ -216,7 +306,7 @@ public final class ResultReporter implements AutoCloseable {
         try {
             task.run();
         } catch (RuntimeException ignored) {
-            // A later scheduler tick retries durable terminal work.
+            // 后续调度周期会重试持久化终态任务。
         }
     }
 

@@ -2,13 +2,13 @@ package com.staterelay.server.dag.dispatch;
 
 import java.time.Instant;
 
-/** Application-facing boundary for durable DAG assignment and delivery. */
+/** 面向应用层的持久化 DAG 分配与投递边界。 */
 public interface DagDispatchGateway {
 
-    /** Reserves a Worker and delivers the command after the reservation transaction commits. */
+    /** 预留 Worker，并在预留事务提交后投递命令。 */
     DagDispatchCoordinator.Outcome dispatch(
             DagDispatchStore.ReservationRequest request, Instant now);
 
-    /** Retransmits due uncertain commands with their existing logical request identity. */
+    /** 使用原有逻辑请求标识重发到期的不确定命令。 */
     int retryUncertain(Instant now, int batchSize);
 }

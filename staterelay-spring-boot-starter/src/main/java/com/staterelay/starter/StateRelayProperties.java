@@ -23,6 +23,9 @@ public final class StateRelayProperties {
     /** Worker 工作目录根路径（GIS-Worker 设计文档 §14.1） */
     private String workBaseDirectory = "./work";
 
+    /** 是否保留失败执行尝试的工作目录，默认终态即清理 */
+    private boolean retainFailedAttemptDirectory;
+
     public boolean isEnabled() {
         return enabled;
     }
@@ -117,6 +120,14 @@ public final class StateRelayProperties {
 
     public void setWorkBaseDirectory(String workBaseDirectory) {
         this.workBaseDirectory = workBaseDirectory;
+    }
+
+    public boolean isRetainFailedAttemptDirectory() {
+        return retainFailedAttemptDirectory;
+    }
+
+    public void setRetainFailedAttemptDirectory(boolean retainFailedAttemptDirectory) {
+        this.retainFailedAttemptDirectory = retainFailedAttemptDirectory;
     }
 
     public enum Environment {

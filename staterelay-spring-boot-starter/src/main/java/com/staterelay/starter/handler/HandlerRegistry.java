@@ -5,6 +5,7 @@ import com.staterelay.contract.handler.TaskHandler;
 import com.staterelay.contract.handler.spi.AlgorithmExecutor;
 import lombok.AllArgsConstructor;
 import lombok.Data;
+import lombok.NoArgsConstructor;
 import org.springframework.aop.support.AopUtils;
 import org.springframework.beans.factory.ListableBeanFactory;
 import org.springframework.core.ResolvableType;
@@ -131,10 +132,13 @@ public final class HandlerRegistry {
     /**
      * Handler 元数据，包含算法契约信息（当 handler 是 {@link AlgorithmExecutor} 时）。
      */
-    public record HandlerMetadata(
-            String name,
-            String implementationType,
-            AlgorithmContract algorithmContract) {
+    @Data
+    @NoArgsConstructor
+    @AllArgsConstructor
+    public static class HandlerMetadata {
+        private String name;
+        private String implementationType;
+        private AlgorithmContract algorithmContract;
 
         /**
          * 向后兼容的构造器（无算法契约）。
@@ -147,11 +151,14 @@ public final class HandlerRegistry {
     /**
      * 算法契约元数据（§3.2），用于 Worker 心跳上报供调度中心校验。
      */
-    public record AlgorithmContract(
-            String algorithmCode,
-            String contractVersion,
-            String contractChecksum,
-            String implementationVersion) {
+    @Data
+    @NoArgsConstructor
+    @AllArgsConstructor
+    public static class AlgorithmContract {
+        private String algorithmCode;
+        private String contractVersion;
+        private String contractChecksum;
+        private String implementationVersion;
     }
 
     @Data

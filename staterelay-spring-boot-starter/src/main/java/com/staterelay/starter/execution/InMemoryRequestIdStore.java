@@ -2,8 +2,10 @@ package com.staterelay.starter.execution;
 
 import java.time.Duration;
 import java.time.Instant;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
@@ -22,7 +24,7 @@ import java.util.concurrent.atomic.AtomicInteger;
  *   <li>升级后内部 leaseVersion / workerEpoch 同步更新为 newFence</li>
  * </ul>
  */
-public class InMemoryRequestIdStore implements RequestIdStore {
+public class InMemoryRequestIdStore implements RequestIdStore, RequestIdStore.AtomicLifecycle {
 
     private final ConcurrentHashMap<String, RequestIdRecord> records = new ConcurrentHashMap<>();
 
@@ -116,9 +118,33 @@ public class InMemoryRequestIdStore implements RequestIdStore {
 
     @Override
     public boolean rebindFence(String requestId, RequestFence newFence, Instant now) {
+        return rebindAtomically(requestId, null, newFence, now);
+    }
+
+    @Override
+    public boolean compareAndRebind(
+            String requestId,
+            String requestChecksum,
+            RequestFence newFence,
+            Instant now) {
+        return rebindAtomically(requestId, requestChecksum, newFence, now);
+    }
+
+    private boolean rebindAtomically(
+            String requestId,
+            String requestChecksum,
+            RequestFence newFence,
+            Instant now) {
         // compute 保证原子性（§44：跨 Scheduler 并发升级只允许一个成功）
         // 注意：ConcurrentHashMap.computeIfPresent 返回 null 会删除 entry，所以不升级时必须返回 current
-        RequestIdRecord updated = records.computeIfPresent(requestId, (id, current) -> {
+        AtomicBoolean upgraded = new AtomicBoolean(false);
+        records.computeIfPresent(requestId, (id, current) -> {
+            if (requestChecksum != null
+                    && !current.requestChecksum().equals(requestChecksum)) {
+                throw new IllegalArgumentException(
+                        "rebindFence checksum mismatch: stored=" + current.requestChecksum()
+                                + " incoming=" + requestChecksum);
+            }
             // 1. 围栏完整性校验（attemptId / workerId 必须匹配）
             if (!current.attemptId().equals(newFence.attemptId())) {
                 throw new IllegalArgumentException(
@@ -141,6 +167,7 @@ public class InMemoryRequestIdStore implements RequestIdStore {
             if (current.state() == RequestState.RUNNING
                     || current.state() == RequestState.SUCCESS
                     || current.state() == RequestState.FAILED) {
+                upgraded.set(true);
                 return new RequestIdRecord(
                         current.requestId(),
                         current.requestChecksum(),
@@ -159,12 +186,26 @@ public class InMemoryRequestIdStore implements RequestIdStore {
             // 状态不合法，不升级：返回原记录
             return current;
         });
-        // updated != null 表示记录存在；升级是否成功取决于其 leaseVersion 是否变化
-        if (updated == null) {
-            return false;  // 记录不存在
-        }
-        return updated.leaseVersion().equals(newFence.leaseVersion())
-                && (updated.workerEpoch() == null ? newFence.workerEpoch() == null : updated.workerEpoch().equals(newFence.workerEpoch()));
+        return upgraded.get();
+    }
+
+    @Override
+    public boolean compareAndAbort(
+            String requestId, String requestChecksum, RequestFence fence) {
+        AtomicBoolean aborted = new AtomicBoolean(false);
+        records.computeIfPresent(requestId, (id, current) -> {
+            if (current.state() == RequestState.RUNNING
+                    && Objects.equals(current.requestChecksum(), requestChecksum)
+                    && Objects.equals(current.attemptId(), fence.attemptId())
+                    && Objects.equals(current.workerId(), fence.workerId())
+                    && Objects.equals(current.workerEpoch(), fence.workerEpoch())
+                    && Objects.equals(current.leaseVersion(), fence.leaseVersion())) {
+                aborted.set(true);
+                return null;
+            }
+            return current;
+        });
+        return aborted.get();
     }
 
     @Override

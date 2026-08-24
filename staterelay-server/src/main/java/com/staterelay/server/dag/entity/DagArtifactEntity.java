@@ -103,6 +103,34 @@ public class DagArtifactEntity {
     @Column(name = "attempt_no")
     private Integer attemptNo;
 
+    /** 登记 Artifact 时使用的请求标识。 */
+    @Column(name = "request_id", length = 128)
+    private String requestId;
+
+    /** 请求业务参数摘要。 */
+    @Column(name = "request_checksum", length = 128)
+    private String requestChecksum;
+
+    /** 调度代次。 */
+    @Column(name = "dispatch_generation")
+    private Long dispatchGeneration;
+
+    /** 调度令牌。 */
+    @Column(name = "dispatch_token", length = 128)
+    private String dispatchToken;
+
+    /** Attempt 租约版本。 */
+    @Column(name = "attempt_lease_version")
+    private Long attemptLeaseVersion;
+
+    /** Worker 标识。 */
+    @Column(name = "worker_id", length = 160)
+    private String workerId;
+
+    /** Worker 启动代次。 */
+    @Column(name = "worker_epoch", length = 64)
+    private String workerEpoch;
+
     @Column(name = "created_at", nullable = false, updatable = false)
     private Instant createdAt;
 
@@ -110,4 +138,3 @@ public class DagArtifactEntity {
     @Column(name = "updated_at", nullable = false)
     private Instant updatedAt;
 }
-

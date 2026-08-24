@@ -3,6 +3,69 @@
         "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
 <mapper namespace="com.staterelay.server.dag.mapper.DagArtifactMapper">
 
+    <!-- 上传围栏：执行仍活跃且容量尚未释放，终态后禁止继续写入。 -->
+    <select id="matchesActiveFence" resultType="boolean">
+        SELECT EXISTS (
+            SELECT 1
+            FROM sr_dag_node_attempt a
+            JOIN sr_dag_node_instance n ON n.id = a.node_instance_id
+            JOIN sr_dag_instance d ON d.id = a.dag_instance_id
+            JOIN sr_worker w ON CAST(w.id AS varchar) = a.worker_id
+            WHERE a.id = CAST(#{context.attemptId} AS bigint)
+              AND a.dag_instance_id = #{context.dagInstanceId}
+              AND a.node_instance_id = #{context.nodeInstanceId}
+              AND a.attempt_no = #{context.attemptNo}
+              AND a.request_id = #{context.requestId}
+              AND a.request_checksum = #{context.requestChecksum}
+              AND a.dispatch_generation = #{context.dispatchGeneration}
+              AND a.dispatch_token = #{context.dispatchToken}
+              AND a.attempt_lease_version = #{context.attemptLeaseVersion}
+              AND a.worker_id = #{context.workerId}
+              AND a.worker_epoch = #{context.workerEpoch}
+              AND n.dag_instance_id = #{context.dagInstanceId}
+              AND n.node_id = #{context.nodeCode}
+              AND n.current_attempt_id = a.id
+              AND n.current_attempt_no = a.attempt_no
+              AND n.dispatch_generation = a.dispatch_generation
+              AND n.dispatch_token = a.dispatch_token
+              AND d.status = 10
+              AND n.status = 40
+              AND a.status IN (20, 30)
+              AND a.capacity_released_at IS NULL
+              AND CAST(w.worker_epoch AS varchar) = #{context.workerEpoch}
+        )
+    </select>
+
+    <!-- 结果围栏：成功结果已落库；最终节点可在 DAG 同时转为 SUCCESS 后继续完成晋升。 -->
+    <select id="matchesAcceptedSuccessFence" resultType="boolean">
+        SELECT EXISTS (
+            SELECT 1
+            FROM sr_dag_node_attempt a
+            JOIN sr_dag_node_instance n ON n.id = a.node_instance_id
+            JOIN sr_dag_instance d ON d.id = a.dag_instance_id
+            WHERE a.id = CAST(#{context.attemptId} AS bigint)
+              AND a.dag_instance_id = #{context.dagInstanceId}
+              AND a.node_instance_id = #{context.nodeInstanceId}
+              AND a.attempt_no = #{context.attemptNo}
+              AND a.request_id = #{context.requestId}
+              AND a.request_checksum = #{context.requestChecksum}
+              AND a.dispatch_generation = #{context.dispatchGeneration}
+              AND a.dispatch_token = #{context.dispatchToken}
+              AND a.attempt_lease_version = #{context.attemptLeaseVersion}
+              AND a.worker_id = #{context.workerId}
+              AND a.worker_epoch = #{context.workerEpoch}
+              AND a.status = 40
+              AND n.dag_instance_id = #{context.dagInstanceId}
+              AND n.node_id = #{context.nodeCode}
+              AND n.current_attempt_id = a.id
+              AND n.current_attempt_no = a.attempt_no
+              AND n.dispatch_generation = a.dispatch_generation
+              AND n.dispatch_token = a.dispatch_token
+              AND n.status = 50
+              AND d.status IN (10, 20)
+        )
+    </select>
+
     <resultMap id="ArtifactMetadataMap" type="com.staterelay.contract.dag.artifact.ArtifactMetadataResponse">
         <id     property="artifactId"     column="id"/>
         <result property="status"         column="status_enum"/>
@@ -112,6 +175,67 @@
             updated_at = #{now}
         WHERE id = #{artifactId}
           AND status = 50
+    </update>
+
+    <!-- 只有当前完整围栏下、归属于同一 Attempt 的被引用成果才可用。 -->
+    <update id="promoteReferencedArtifacts">
+        UPDATE sr_dag_artifact
+        SET status = 30,
+            updated_at = #{now}
+        WHERE attempt_id = #{context.attemptId}
+          AND status = 20
+          AND id IN
+          <foreach collection="artifactIds" item="artifactId" open="(" separator="," close=")">
+              #{artifactId}
+          </foreach>
+          AND EXISTS (
+              SELECT 1
+              FROM sr_dag_node_attempt a
+              JOIN sr_dag_node_instance n ON n.id = a.node_instance_id
+              JOIN sr_dag_instance d ON d.id = a.dag_instance_id
+              WHERE a.id = CAST(#{context.attemptId} AS bigint)
+                AND a.dag_instance_id = #{context.dagInstanceId}
+                AND a.node_instance_id = #{context.nodeInstanceId}
+                AND a.attempt_no = #{context.attemptNo}
+                AND a.request_id = #{context.requestId}
+                AND a.request_checksum = #{context.requestChecksum}
+                AND a.dispatch_generation = #{context.dispatchGeneration}
+                AND a.dispatch_token = #{context.dispatchToken}
+                AND a.attempt_lease_version = #{context.attemptLeaseVersion}
+                AND a.worker_id = #{context.workerId}
+                AND a.worker_epoch = #{context.workerEpoch}
+                AND n.dag_instance_id = #{context.dagInstanceId}
+                AND n.node_id = #{context.nodeCode}
+                AND n.current_attempt_id = a.id
+                AND n.current_attempt_no = a.attempt_no
+                AND n.dispatch_generation = a.dispatch_generation
+                AND n.dispatch_token = a.dispatch_token
+                AND a.status = 40
+                AND n.status = 50
+                AND d.status IN (10, 20)
+          )
+    </update>
+
+    <!-- 失败、晚到以及成功结果未引用的 STAGED 成果统一进入 ORPHANED。 -->
+    <update id="orphanUnreferencedArtifacts">
+        UPDATE sr_dag_artifact
+        SET status = 40,
+            updated_at = #{now}
+        WHERE attempt_id = #{context.attemptId}
+          AND status = 20
+          AND request_id = #{context.requestId}
+          AND request_checksum = #{context.requestChecksum}
+          AND dispatch_generation = #{context.dispatchGeneration}
+          AND dispatch_token = #{context.dispatchToken}
+          AND attempt_lease_version = #{context.attemptLeaseVersion}
+          AND worker_id = #{context.workerId}
+          AND worker_epoch = #{context.workerEpoch}
+        <if test="availableArtifactIds != null and availableArtifactIds.size() > 0">
+          AND id NOT IN
+          <foreach collection="availableArtifactIds" item="artifactId" open="(" separator="," close=")">
+              #{artifactId}
+          </foreach>
+        </if>
     </update>
 
 </mapper>

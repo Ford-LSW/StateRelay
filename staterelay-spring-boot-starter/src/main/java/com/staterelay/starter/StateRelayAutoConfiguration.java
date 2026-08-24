@@ -140,7 +140,8 @@ public class StateRelayAutoConfiguration {
     @ConditionalOnMissingBean
     @ConditionalOnProperty(prefix = "staterelay", name = "enabled", havingValue = "true")
     WorkDirectoryManager stateRelayWorkDirectoryManager(StateRelayProperties properties) {
-        return new WorkDirectoryManager(properties.getWorkBaseDirectory());
+        return new WorkDirectoryManager(properties.getWorkBaseDirectory(),
+                properties.isRetainFailedAttemptDirectory());
     }
 
     /**
@@ -170,7 +171,8 @@ public class StateRelayAutoConfiguration {
             LocalDispatchStore store,
             RestClient.Builder restClientBuilder,
             StateRelayProperties properties,
-            TaskScheduler stateRelayTaskScheduler) {
+            TaskScheduler stateRelayTaskScheduler,
+            RequestIdStore requestIdStore) {
         ResultReporter reporter = new ResultReporter(
                 store,
                 new ResultReporter.RestClientTransport(
@@ -179,7 +181,8 @@ public class StateRelayAutoConfiguration {
                 java.time.Duration.ofSeconds(5),
                 java.time.Duration.ofSeconds(1),
                 java.time.Duration.ofSeconds(10),
-                java.time.Duration.ofMinutes(5));
+                java.time.Duration.ofMinutes(5),
+                requestIdStore);
         reporter.start(stateRelayTaskScheduler);
         return reporter;
     }
@@ -207,12 +210,13 @@ public class StateRelayAutoConfiguration {
             WorkDirectoryManager workDirectoryManager,
             ArtifactClient artifactClient,
             ArtifactMetadataClient artifactMetadataClient,
-            WorkerRegistrationClient registrationClient) {
+            WorkerRegistrationClient registrationClient,
+            RequestIdStore requestIdStore) {
         ExecutionCoordinator coordinator = new ExecutionCoordinator(
                 properties, identityProvider, handlers, objectMapper, store, reporter,
                 new WorkerActivityListener(registrationClient),
                 Clock.systemUTC(),
-                workDirectoryManager, artifactClient, artifactMetadataClient);
+                workDirectoryManager, artifactClient, artifactMetadataClient, requestIdStore);
         return coordinator;
     }
 

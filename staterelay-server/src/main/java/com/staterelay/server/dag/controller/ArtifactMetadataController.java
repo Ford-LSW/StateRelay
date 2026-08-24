@@ -3,6 +3,7 @@ package com.staterelay.server.dag.controller;
 import com.staterelay.contract.dag.artifact.ArtifactMetadataResponse;
 import com.staterelay.contract.dag.artifact.ArtifactStageRequest;
 import com.staterelay.contract.dag.artifact.ArtifactStageResponse;
+import com.staterelay.contract.dag.algorithm.WorkerExecutionContext;
 import com.staterelay.server.dag.service.SpatialArtifactService;
 import org.springframework.core.io.InputStreamResource;
 import org.springframework.http.HttpHeaders;
@@ -133,10 +134,31 @@ public class ArtifactMetadataController {
             @RequestParam("nodeCode") String nodeCode,
             @RequestParam("attemptId") String attemptId,
             @RequestParam("attemptNo") Integer attemptNo,
-            @RequestParam("outputKey") String outputKey) {
+            @RequestParam("outputKey") String outputKey,
+            @RequestParam("nodeInstanceId") Long nodeInstanceId,
+            @RequestParam("requestId") String requestId,
+            @RequestParam("requestChecksum") String requestChecksum,
+            @RequestParam("dispatchGeneration") Long dispatchGeneration,
+            @RequestParam("dispatchToken") String dispatchToken,
+            @RequestParam("attemptLeaseVersion") Long attemptLeaseVersion,
+            @RequestParam("workerId") String workerId,
+            @RequestParam("workerEpoch") String workerEpoch) {
         try {
+            WorkerExecutionContext context = new WorkerExecutionContext();
+            context.setDagInstanceId(dagInstanceId);
+            context.setNodeInstanceId(nodeInstanceId);
+            context.setNodeCode(nodeCode);
+            context.setAttemptId(attemptId);
+            context.setAttemptNo(attemptNo);
+            context.setRequestId(requestId);
+            context.setRequestChecksum(requestChecksum);
+            context.setDispatchGeneration(dispatchGeneration);
+            context.setDispatchToken(dispatchToken);
+            context.setAttemptLeaseVersion(attemptLeaseVersion);
+            context.setWorkerId(workerId);
+            context.setWorkerEpoch(workerEpoch);
             ArtifactStageRequest request = new ArtifactStageRequest(
-                    dagInstanceId, nodeCode, attemptId, attemptNo, outputKey,
+                    context, outputKey,
                     com.staterelay.contract.dag.spatial.VectorStorageType.OBJECT_STORAGE);
             request.setFormat("FILE_GDB");
             return artifactService.uploadDataStream(file.getInputStream(), request);

@@ -200,6 +200,47 @@ public final class TaskAttemptRepository {
     }
 
     /**
+     * 仅允许当前普通任务执行围栏单调更新进度，并把已接受的 Attempt 推进为 RUNNING。
+     */
+    public boolean casReportProgress(
+            UUID taskInstanceId,
+            UUID attemptId,
+            long leaseVersion,
+            UUID workerId,
+            UUID workerEpoch,
+            int progressPercent,
+            String progressMessage) {
+        if (progressPercent < 0 || progressPercent > 100) {
+            throw new IllegalArgumentException("progress percent must be between 0 and 100");
+        }
+        return jdbc.update("""
+                UPDATE sr_task_attempt attempt
+                SET status = 'RUNNING',
+                    started_at = COALESCE(attempt.started_at, clock_timestamp()),
+                    progress_percent = GREATEST(attempt.progress_percent, :progressPercent),
+                    progress_message = CASE
+                        WHEN :progressPercent >= attempt.progress_percent
+                        THEN :progressMessage ELSE attempt.progress_message END,
+                    updated_at = clock_timestamp()
+                WHERE attempt.id = :attemptId
+                  AND attempt.task_instance_id = :instanceId
+                  AND attempt.lease_version = :leaseVersion
+                  AND attempt.worker_id = :workerId
+                  AND attempt.worker_epoch = :workerEpoch
+                  AND attempt.status IN ('ACCEPTED', 'RUNNING')
+                  AND EXISTS (
+                      SELECT 1
+                      FROM sr_task_instance instance
+                      WHERE instance.id = attempt.task_instance_id
+                        AND instance.current_lease_version = attempt.lease_version
+                        AND instance.status = 'RUNNING')
+                """, fenceParameters(
+                taskInstanceId, attemptId, leaseVersion, workerId, workerEpoch)
+                .addValue("progressPercent", progressPercent)
+                .addValue("progressMessage", progressMessage)) == 1;
+    }
+
+    /**
      * Compatibility entry point for callers that only carry the original Attempt fence. The
      * remaining persisted identifiers are read, then revalidated by the fully fenced transaction.
      */

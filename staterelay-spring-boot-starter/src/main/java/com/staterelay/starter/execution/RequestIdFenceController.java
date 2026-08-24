@@ -71,7 +71,8 @@ public final class RequestIdFenceController {
                 request.newLeaseVersion());
 
         try {
-            boolean upgraded = requestIdStore.rebindFence(requestId, fence, now);
+            boolean upgraded = requestIdStore.rebindFence(
+                    requestId, request.requestChecksum(), fence, now);
             if (!upgraded) {
                 return RebindFenceResponse.failed(
                         "rebindFence rejected: version not monotonic, fence mismatch, or state not in {RUNNING,SUCCESS,FAILED}");

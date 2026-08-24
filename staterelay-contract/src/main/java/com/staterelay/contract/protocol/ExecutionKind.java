@@ -1,6 +1,6 @@
 package com.staterelay.contract.protocol;
 
-/** Identifies the persistence domain owning an active Worker execution lease. */
+/** 标识活跃 Worker 执行租约所属的持久化领域。 */
 public enum ExecutionKind {
     GENERIC_TASK,
     DAG_NODE

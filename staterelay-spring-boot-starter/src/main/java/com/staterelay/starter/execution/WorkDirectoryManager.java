@@ -8,7 +8,9 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.Comparator;
 import java.util.Objects;
+import java.util.regex.Pattern;
 import java.util.logging.Logger;
 
 /**
@@ -39,12 +41,20 @@ import java.util.logging.Logger;
 public class WorkDirectoryManager {
 
     private static final Logger log = Logger.getLogger(WorkDirectoryManager.class.getName());
+    private static final Pattern SAFE_NAME = Pattern.compile("[A-Za-z0-9][A-Za-z0-9._-]{0,127}");
 
     private final Path workBaseDir;
+    private final boolean retainFailedAttempt;
+
+    public WorkDirectoryManager(String workBaseDirectory) {
+        this(workBaseDirectory, false);
+    }
 
     public WorkDirectoryManager(
-            @Value("${staterelay.work-base-directory:./work}") String workBaseDirectory) {
+            @Value("${staterelay.work-base-directory:./work}") String workBaseDirectory,
+            @Value("${staterelay.retain-failed-attempt-directory:false}") boolean retainFailedAttempt) {
         this.workBaseDir = Paths.get(workBaseDirectory).toAbsolutePath().normalize();
+        this.retainFailedAttempt = retainFailedAttempt;
         log.info("WorkDirectoryManager initialized: base=" + workBaseDir);
     }
 
@@ -65,10 +75,9 @@ public class WorkDirectoryManager {
         Objects.requireNonNull(nodeCode, "nodeCode");
         Objects.requireNonNull(attemptId, "attemptId");
 
-        Path root = workBaseDir
-            .resolve(String.valueOf(dagInstanceId))
-            .resolve(nodeCode)
-            .resolve(attemptId);
+        validateIdentifier(nodeCode, "节点编码");
+        validateIdentifier(attemptId, "执行尝试标识");
+        Path root = resolveAttemptRoot(dagInstanceId, nodeCode, attemptId);
 
         Path inputDir = root.resolve("input");
         Path tempDir = root.resolve("temp");
@@ -97,10 +106,9 @@ public class WorkDirectoryManager {
      * 本方法做 best-effort 清理，不抛异常。
      */
     public void cleanupWorkDirectory(Long dagInstanceId, String nodeCode, String attemptId) {
-        Path root = workBaseDir
-            .resolve(String.valueOf(dagInstanceId))
-            .resolve(nodeCode)
-            .resolve(attemptId);
+        validateIdentifier(nodeCode, "节点编码");
+        validateIdentifier(attemptId, "执行尝试标识");
+        Path root = resolveAttemptRoot(dagInstanceId, nodeCode, attemptId);
         try {
             deleteRecursively(root);
             log.info("Work directory cleaned: dagInstanceId=" + dagInstanceId
@@ -110,12 +118,70 @@ public class WorkDirectoryManager {
         }
     }
 
+    /**
+     * 按执行终态应用目录保留策略。
+     *
+     * @param dagInstanceId DAG 实例标识
+     * @param nodeCode 节点编码
+     * @param attemptId 执行尝试标识
+     * @param succeeded 是否执行成功
+     */
+    public void cleanupOnTerminal(Long dagInstanceId, String nodeCode, String attemptId,
+                                  boolean succeeded) {
+        if (!succeeded && retainFailedAttempt) {
+            log.info("已按配置保留失败执行目录: attemptId=" + attemptId);
+            return;
+        }
+        cleanupWorkDirectory(dagInstanceId, nodeCode, attemptId);
+    }
+
+    /**
+     * 生成安全且稳定的物理输出文件名。
+     *
+     * @param outputKey 输出端口名
+     * @param extension 扩展名，可为空
+     * @return 物理输出文件名
+     */
+    public String physicalOutputName(String outputKey, String extension) {
+        validateIdentifier(outputKey, "输出端口名");
+        if (extension == null || extension.isBlank()) {
+            return outputKey;
+        }
+        String normalizedExtension = extension.startsWith(".") ? extension.substring(1) : extension;
+        validateIdentifier(normalizedExtension, "输出扩展名");
+        return outputKey + "." + normalizedExtension;
+    }
+
+    private Path resolveAttemptRoot(Long dagInstanceId, String nodeCode, String attemptId) {
+        Objects.requireNonNull(dagInstanceId, "DAG 实例标识不能为空");
+        if (dagInstanceId < 0) {
+            throw new IllegalArgumentException("DAG 实例标识不能为负数");
+        }
+        Path root = workBaseDir.resolve(String.valueOf(dagInstanceId))
+            .resolve(nodeCode).resolve(attemptId).normalize();
+        if (!root.startsWith(workBaseDir)) {
+            throw new IllegalArgumentException("工作目录超出基础目录边界");
+        }
+        return root;
+    }
+
+    private void validateIdentifier(String value, String fieldName) {
+        Objects.requireNonNull(value, fieldName + "不能为空");
+        if (!SAFE_NAME.matcher(value).matches() || value.equals(".") || value.equals("..")) {
+            throw new IllegalArgumentException(fieldName + "包含非法字符: " + value);
+        }
+    }
+
     private void deleteRecursively(Path path) throws IOException {
         if (!Files.exists(path)) {
             return;
         }
-        try (var stream = Files.walk(path)) {
-            stream.sorted(java.util.Comparator.reverseOrder())
+        Path normalized = path.toAbsolutePath().normalize();
+        if (!normalized.startsWith(workBaseDir) || normalized.equals(workBaseDir)) {
+            throw new IOException("拒绝清理基础目录之外的路径: " + normalized);
+        }
+        try (java.util.stream.Stream<Path> stream = Files.walk(normalized)) {
+            stream.sorted(Comparator.reverseOrder())
                 .forEach(p -> {
                     try {
                         Files.deleteIfExists(p);

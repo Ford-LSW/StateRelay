@@ -3,6 +3,9 @@ package com.staterelay.starter.registration;
 import com.staterelay.starter.StateRelayProperties;
 import com.staterelay.starter.handler.HandlerRegistry;
 import com.staterelay.contract.protocol.ExecutionKind;
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.NoArgsConstructor;
 import org.springframework.boot.context.event.ApplicationReadyEvent;
 import org.springframework.context.ApplicationListener;
 import org.springframework.scheduling.TaskScheduler;
@@ -114,21 +117,21 @@ public final class WorkerRegistrationClient
     private Set<HandlerMetadata> handlerMetadata() {
         return handlers.metadata().values().stream()
                 .map(metadata -> {
-                    HandlerRegistry.AlgorithmContract contract = metadata.algorithmContract();
+                    HandlerRegistry.AlgorithmContract contract = metadata.getAlgorithmContract();
                     if (contract != null) {
                         // AlgorithmExecutor：上报算法契约供调度中心校验一致性（§3.2）
                         return new HandlerMetadata(
-                                metadata.name(),
-                                metadata.implementationType(),
-                                contract.algorithmCode(),
-                                contract.contractVersion(),
-                                contract.contractChecksum(),
-                                contract.implementationVersion());
+                            metadata.getName(),
+                            metadata.getImplementationType(),
+                            contract.getAlgorithmCode(),
+                            contract.getContractVersion(),
+                            contract.getContractChecksum(),
+                            contract.getImplementationVersion());
                     }
                     // 普通 TaskHandler：仅上报 name + implementationType
                     return new HandlerMetadata(
-                            metadata.name(),
-                            metadata.implementationType(),
+                            metadata.getName(),
+                            metadata.getImplementationType(),
                             null, null, null, null);
                 })
                 .collect(java.util.stream.Collectors.toUnmodifiableSet());
@@ -177,13 +180,16 @@ public final class WorkerRegistrationClient
             List<ExecutionLease> activeLeases) {
     }
 
-    public record HandlerMetadata(
-            String name,
-            String implementationType,
-            String algorithmCode,
-            String contractVersion,
-            String contractChecksum,
-            String implementationVersion) {
+    @Data
+    @NoArgsConstructor
+    @AllArgsConstructor
+    public static class HandlerMetadata {
+        private String name;
+        private String implementationType;
+        private String algorithmCode;
+        private String contractVersion;
+        private String contractChecksum;
+        private String implementationVersion;
 
         /**
          * 向后兼容的构造器（非算法 Handler）。
@@ -193,19 +199,32 @@ public final class WorkerRegistrationClient
         }
     }
 
-    public record ExecutionLease(
-            String attemptId,
-            long leaseVersion,
-            UUID workerEpoch,
-            ExecutionKind kind) {
+    @Data
+    @NoArgsConstructor
+    public static class ExecutionLease {
+        private String attemptId;
+        private long leaseVersion;
+        private UUID workerEpoch;
+        private ExecutionKind kind = ExecutionKind.GENERIC_TASK;
 
-        public ExecutionLease {
-            kind = kind == null ? ExecutionKind.GENERIC_TASK : kind;
+        public ExecutionLease(
+                String attemptId,
+                long leaseVersion,
+                UUID workerEpoch,
+                ExecutionKind kind) {
+            this.attemptId = attemptId;
+            this.leaseVersion = leaseVersion;
+            this.workerEpoch = workerEpoch;
+            this.kind = kind == null ? ExecutionKind.GENERIC_TASK : kind;
         }
 
-        /** Preserves the original generic-task constructor and JSON semantics. */
+        /** 保留原有普通任务构造方式与 JSON 语义。 */
         public ExecutionLease(UUID attemptId, long leaseVersion, UUID workerEpoch) {
             this(attemptId.toString(), leaseVersion, workerEpoch, ExecutionKind.GENERIC_TASK);
+        }
+
+        public void setKind(ExecutionKind kind) {
+            this.kind = kind == null ? ExecutionKind.GENERIC_TASK : kind;
         }
     }
 

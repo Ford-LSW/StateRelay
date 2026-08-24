@@ -102,6 +102,39 @@ public interface RequestIdStore {
     boolean rebindFence(String requestId, RequestFence newFence, Instant now);
 
     /**
+     * HTTP 恢复协议使用的 checksum 感知原子围栏升级入口。
+     *
+     * <p>旧三参数 SPI 保持源码兼容；新入口只委派给显式声明的原子生命周期能力，
+     * 不允许通过 find + rebind 拼接出存在竞态窗口的默认实现。
+     */
+    default boolean rebindFence(
+            String requestId,
+            String requestChecksum,
+            RequestFence newFence,
+            Instant now) {
+        if (this instanceof AtomicLifecycle lifecycle) {
+            return lifecycle.compareAndRebind(
+                    requestId, requestChecksum, newFence, now);
+        }
+        throw new UnsupportedOperationException(
+                "RequestIdStore does not provide atomic lifecycle operations");
+    }
+
+    /**
+     * 精确撤销尚未开始执行的 RUNNING 记录。
+     *
+     * <p>requestId、checksum、attempt、worker、epoch 与 lease 必须在同一次原子比较中全部匹配。
+     */
+    default boolean abortRunningStart(
+            String requestId, String requestChecksum, RequestFence fence) {
+        if (this instanceof AtomicLifecycle lifecycle) {
+            return lifecycle.compareAndAbort(requestId, requestChecksum, fence);
+        }
+        throw new UnsupportedOperationException(
+                "RequestIdStore does not provide atomic lifecycle operations");
+    }
+
+    /**
      * 清理已确认终态记录（对齐文档 §44）。
      *
      * <p>只能清理已经确认的终态记录（Scheduler 已落库）；
@@ -112,6 +145,21 @@ public interface RequestIdStore {
      * @return 已清理的记录数
      */
     int cleanup(Duration retention, Instant now);
+
+    /**
+     * 新增原子生命周期能力；旧 RequestIdStore 实现无需实现即可继续编译。
+     */
+    interface AtomicLifecycle {
+
+        boolean compareAndRebind(
+                String requestId,
+                String requestChecksum,
+                RequestFence newFence,
+                Instant now);
+
+        boolean compareAndAbort(
+                String requestId, String requestChecksum, RequestFence fence);
+    }
 
     /**
      * 围栏信息（用于 tryStart / rebindFence 校验）。

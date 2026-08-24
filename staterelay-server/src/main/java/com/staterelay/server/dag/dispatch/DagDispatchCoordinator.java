@@ -17,7 +17,7 @@ import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 
-/** Coordinates durable DAG assignment and post-commit HTTP delivery. */
+/** 协调持久化 DAG 分配与事务提交后的 HTTP 投递。 */
 @Service
 public class DagDispatchCoordinator implements DagDispatchGateway {
 
@@ -40,7 +40,7 @@ public class DagDispatchCoordinator implements DagDispatchGateway {
         this.sendLease = requirePositive(sendLease, "sendLease");
     }
 
-    /** Reserves in one committed transaction and only then performs the first HTTP send. */
+    /** 在一个事务中完成预留并提交，随后才执行首次 HTTP 发送。 */
     @Override
     public Outcome dispatch(DagDispatchStore.ReservationRequest request, Instant now) {
         Objects.requireNonNull(request, "request");
@@ -49,7 +49,7 @@ public class DagDispatchCoordinator implements DagDispatchGateway {
         return assignment.map(value -> deliver(value, now)).orElse(Outcome.NO_WORKER);
     }
 
-    /** Retransmits due uncertain requests without creating another attempt. */
+    /** 重发到期的不确定请求，不创建新的执行尝试。 */
     @Override
     public int retryUncertain(Instant now, int batchSize) {
         Objects.requireNonNull(now, "now");
@@ -76,7 +76,7 @@ public class DagDispatchCoordinator implements DagDispatchGateway {
         DagDispatchStore.SendClaim send = claimed.get();
         try {
             DispatchAck ack = workerHttpClient.execute(
-                    assignment.workerAddress(), command(assignment));
+                    assignment.getWorkerAddress(), command(assignment));
             if (!matchesFence(assignment, ack)) {
                 store.markUncertain(send, "mismatched or empty dispatch acknowledgement",
                         now.plus(transportRetryDelay));
@@ -96,32 +96,32 @@ public class DagDispatchCoordinator implements DagDispatchGateway {
 
     private ExecuteTaskCommand command(DagDispatchStore.Assignment assignment) {
         WorkerExecutionContext context = new WorkerExecutionContext();
-        context.setDagInstanceId(assignment.dagInstanceId());
-        context.setNodeInstanceId(assignment.nodeInstanceId());
-        context.setNodeCode(assignment.nodeCode());
-        context.setAttemptId(assignment.attemptId().toString());
-        context.setAttemptNo(assignment.attemptNo());
-        context.setRequestId(assignment.requestId());
-        context.setRequestChecksum(assignment.requestChecksum());
-        context.setDispatchGeneration(assignment.dispatchGeneration());
-        context.setDispatchToken(assignment.dispatchToken());
-        context.setAttemptLeaseVersion(assignment.attemptLeaseVersion());
-        context.setWorkerId(assignment.workerId());
-        context.setWorkerEpoch(assignment.workerEpoch());
+        context.setDagInstanceId(assignment.getDagInstanceId());
+        context.setNodeInstanceId(assignment.getNodeInstanceId());
+        context.setNodeCode(assignment.getNodeCode());
+        context.setAttemptId(assignment.getAttemptId().toString());
+        context.setAttemptNo(assignment.getAttemptNo());
+        context.setRequestId(assignment.getRequestId());
+        context.setRequestChecksum(assignment.getRequestChecksum());
+        context.setDispatchGeneration(assignment.getDispatchGeneration());
+        context.setDispatchToken(assignment.getDispatchToken());
+        context.setAttemptLeaseVersion(assignment.getAttemptLeaseVersion());
+        context.setWorkerId(assignment.getWorkerId());
+        context.setWorkerEpoch(assignment.getWorkerEpoch());
         return new ExecuteTaskCommand(
-                assignment.dagInstanceId().toString(), assignment.attemptId().toString(),
-                assignment.attemptNo(), assignment.requestId(), assignment.attemptLeaseVersion(),
-                assignment.application(), assignment.workerId(), assignment.workerEpoch(),
-                assignment.executionCode(), read(assignment.requestJson()), assignment.requestId(),
-                assignment.leaseDuration(), assignment.dispatchedAt(), context);
+                assignment.getDagInstanceId().toString(), assignment.getAttemptId().toString(),
+                assignment.getAttemptNo(), assignment.getRequestId(), assignment.getAttemptLeaseVersion(),
+                assignment.getApplication(), assignment.getWorkerId(), assignment.getWorkerEpoch(),
+                assignment.getExecutionCode(), read(assignment.getRequestJson()), assignment.getRequestId(),
+                assignment.getLeaseDuration(), assignment.getDispatchedAt(), context);
     }
 
     private boolean matchesFence(DagDispatchStore.Assignment assignment, DispatchAck ack) {
         return ack != null
-                && Objects.equals(assignment.requestId(), ack.dispatchId())
-                && Objects.equals(assignment.attemptId().toString(), ack.attemptId())
-                && Objects.equals(assignment.workerId(), ack.workerId())
-                && Objects.equals(assignment.workerEpoch(), ack.workerEpoch());
+                && Objects.equals(assignment.getRequestId(), ack.dispatchId())
+                && Objects.equals(assignment.getAttemptId().toString(), ack.attemptId())
+                && Objects.equals(assignment.getWorkerId(), ack.workerId())
+                && Objects.equals(assignment.getWorkerEpoch(), ack.workerEpoch());
     }
 
     private JsonNode read(String json) {

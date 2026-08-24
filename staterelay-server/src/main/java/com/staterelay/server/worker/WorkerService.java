@@ -5,6 +5,9 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.JsonNodeFactory;
 import com.staterelay.server.persistence.OutboxRepository;
 import com.staterelay.contract.protocol.ExecutionKind;
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.NoArgsConstructor;
 import org.springframework.http.HttpStatus;
 import org.springframework.jdbc.core.namedparam.MapSqlParameterSource;
 import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate;
@@ -148,7 +151,7 @@ public final class WorkerService {
                     workerId, request.workerEpoch(), request.application());
             OffsetDateTime leaseExpiresAt = serverLeaseExpiry(request.workerLease());
             for (ExecutionLease lease : request.activeLeases()) {
-                if (!request.workerEpoch().equals(lease.workerEpoch())) {
+            if (!request.workerEpoch().equals(lease.getWorkerEpoch())) {
                     throw conflict("active execution carries a stale Worker epoch");
                 }
                 int renewed = renewExecutionLease(
@@ -192,12 +195,12 @@ public final class WorkerService {
                     .addValue("workerEpoch", request.workerEpoch())
                     .addValue("activeStatuses", ACTIVE_ATTEMPT_STATUSES), Integer.class);
             List<UUID> reportedAttemptIds = request.activeLeases().stream()
-                    .filter(lease -> lease.kind() == ExecutionKind.GENERIC_TASK)
-                    .map(lease -> parseGenericAttemptId(lease.attemptId()))
+                    .filter(lease -> lease.getKind() == ExecutionKind.GENERIC_TASK)
+                    .map(lease -> parseGenericAttemptId(lease.getAttemptId()))
                     .distinct()
                     .toList();
             int knownReportedAttempts = (int) request.activeLeases().stream()
-                    .map(lease -> lease.kind() + ":" + lease.attemptId())
+                    .map(lease -> lease.getKind() + ":" + lease.getAttemptId())
                     .distinct()
                     .count();
             int reported = jdbc.update("""
@@ -520,13 +523,16 @@ public final class WorkerService {
     public record EpochRequest(UUID workerEpoch) {
     }
 
-    public record HandlerMetadata(
-            String name,
-            String implementationType,
-            String algorithmCode,
-            String contractVersion,
-            String contractChecksum,
-            String implementationVersion) {
+    @Data
+    @NoArgsConstructor
+    @AllArgsConstructor
+    public static class HandlerMetadata {
+        private String name;
+        private String implementationType;
+        private String algorithmCode;
+        private String contractVersion;
+        private String contractChecksum;
+        private String implementationVersion;
 
         public HandlerMetadata(String name, String implementationType) {
             this(name, implementationType, null, null, null, null);
@@ -538,8 +544,8 @@ public final class WorkerService {
             UUID workerEpoch,
             ExecutionLease lease,
             OffsetDateTime leaseExpiresAt) {
-        if (lease.kind() == ExecutionKind.DAG_NODE) {
-            long attemptId = parseDagAttemptId(lease.attemptId());
+        if (lease.getKind() == ExecutionKind.DAG_NODE) {
+            long attemptId = parseDagAttemptId(lease.getAttemptId());
             return jdbc.update("""
                     UPDATE sr_dag_node_attempt attempt
                     SET attempt_lease_expire_time = :leaseExpiresAt,
@@ -563,7 +569,7 @@ public final class WorkerService {
                     """, new MapSqlParameterSource()
                     .addValue("leaseExpiresAt", leaseExpiresAt, Types.TIMESTAMP_WITH_TIMEZONE)
                     .addValue("attemptId", attemptId)
-                    .addValue("leaseVersion", lease.leaseVersion())
+                    .addValue("leaseVersion", lease.getLeaseVersion())
                     .addValue("workerId", workerId)
                     .addValue("workerEpoch", workerEpoch));
         }
@@ -578,8 +584,8 @@ public final class WorkerService {
                   AND status IN (:activeStatuses)
                 """, new MapSqlParameterSource()
                 .addValue("leaseExpiresAt", leaseExpiresAt, Types.TIMESTAMP_WITH_TIMEZONE)
-                .addValue("attemptId", parseGenericAttemptId(lease.attemptId()))
-                .addValue("leaseVersion", lease.leaseVersion())
+                .addValue("attemptId", parseGenericAttemptId(lease.getAttemptId()))
+                .addValue("leaseVersion", lease.getLeaseVersion())
                 .addValue("workerId", workerId)
                 .addValue("workerEpoch", workerEpoch)
                 .addValue("activeStatuses", ACTIVE_ATTEMPT_STATUSES));
@@ -601,18 +607,31 @@ public final class WorkerService {
         }
     }
 
-    public record ExecutionLease(
-            String attemptId,
-            long leaseVersion,
-            UUID workerEpoch,
-            ExecutionKind kind) {
+    @Data
+    @NoArgsConstructor
+    public static class ExecutionLease {
+        private String attemptId;
+        private long leaseVersion;
+        private UUID workerEpoch;
+        private ExecutionKind kind = ExecutionKind.GENERIC_TASK;
 
-        public ExecutionLease {
-            kind = kind == null ? ExecutionKind.GENERIC_TASK : kind;
+        public ExecutionLease(
+                String attemptId,
+                long leaseVersion,
+                UUID workerEpoch,
+                ExecutionKind kind) {
+            this.attemptId = attemptId;
+            this.leaseVersion = leaseVersion;
+            this.workerEpoch = workerEpoch;
+            this.kind = kind == null ? ExecutionKind.GENERIC_TASK : kind;
         }
 
         public ExecutionLease(UUID attemptId, long leaseVersion, UUID workerEpoch) {
             this(attemptId.toString(), leaseVersion, workerEpoch, ExecutionKind.GENERIC_TASK);
+        }
+
+        public void setKind(ExecutionKind kind) {
+            this.kind = kind == null ? ExecutionKind.GENERIC_TASK : kind;
         }
     }
 

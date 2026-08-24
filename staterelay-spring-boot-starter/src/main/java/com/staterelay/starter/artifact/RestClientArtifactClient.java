@@ -17,9 +17,9 @@ import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
-import java.security.MessageDigest;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.UUID;
 import java.util.logging.Logger;
 
 /**
@@ -92,11 +92,19 @@ public class RestClientArtifactClient implements ArtifactClient {
             throw new ArtifactDownloadException(artifactId,
                     "Artifact not found or not AVAILABLE: " + artifactId);
         }
-        String expectedChecksum = metaOpt.get().getChecksum();
+        ArtifactMetadataResponse metadata = metaOpt.get();
+        String expectedChecksum = metadata.getChecksum();
+        boolean directoryArtifact = isDirectoryArtifact(metadata.getFormat());
+        Path downloadPath = directoryArtifact
+                ? targetPath.resolveSibling(targetPath.getFileName() + ".download.zip")
+                : targetPath;
 
         // 2. 下载流到本地文件
         try {
-            Files.createDirectories(targetPath.getParent());
+            Path parent = downloadPath.toAbsolutePath().normalize().getParent();
+            if (parent != null) {
+                Files.createDirectories(parent);
+            }
             Resource resource = restClient.get()
                     .uri("/internal/v1/artifacts/{artifactId}/data", artifactId)
                     .accept(MediaType.APPLICATION_OCTET_STREAM)
@@ -107,23 +115,32 @@ public class RestClientArtifactClient implements ArtifactClient {
                         "Download returned empty body for artifactId=" + artifactId);
             }
             try (InputStream in = resource.getInputStream()) {
-                Files.copy(in, targetPath, StandardCopyOption.REPLACE_EXISTING);
+                Files.copy(in, downloadPath, StandardCopyOption.REPLACE_EXISTING);
             }
         } catch (HttpClientErrorException.NotFound notFound) {
             throw new ArtifactDownloadException(artifactId,
                     "Artifact data not found: " + artifactId, notFound);
         } catch (IOException e) {
             throw new ArtifactDownloadException(artifactId,
-                    "Failed to write downloaded file to " + targetPath + ": " + e.getMessage(), e);
+                    "下载 Artifact 文件失败: " + downloadPath, e);
         }
 
         // 3. 校验 checksum（§15.1，防止传输损坏或调度侧文件丢失）
         if (expectedChecksum != null && !expectedChecksum.isBlank()) {
-            String actualChecksum = computeChecksum(targetPath);
+            String actualChecksum = SafeZipSupport.sha256(downloadPath);
             if (!expectedChecksum.equals(actualChecksum)) {
+                deleteQuietly(downloadPath);
                 throw new ArtifactDownloadException(artifactId,
-                        "Checksum mismatch: expected=" + expectedChecksum
+                        "Artifact 校验和不一致: expected=" + expectedChecksum
                                 + ", actual=" + actualChecksum);
+            }
+        }
+
+        if (directoryArtifact) {
+            try {
+                SafeZipSupport.unzip(downloadPath, targetPath);
+            } finally {
+                deleteQuietly(downloadPath);
             }
         }
 
@@ -156,25 +173,36 @@ public class RestClientArtifactClient implements ArtifactClient {
             throw new IllegalStateException("Result file not found: " + localPath);
         }
 
-        // 1. 构造 multipart 请求
-        MultiValueMap<String, Object> parts = new LinkedMultiValueMap<>();
-        parts.add("file", new FileSystemResource(localPath));
-        parts.add("dagInstanceId", request.getDagInstanceId());
-        parts.add("nodeCode", request.getNodeCode());
-        parts.add("attemptId", request.getAttemptId());
-        parts.add("attemptNo", request.getAttemptNo());
-        parts.add("outputKey", request.getOutputKey());
+        Path uploadPath = localPath;
+        boolean temporaryArchive = Files.isDirectory(localPath);
+        if (temporaryArchive) {
+            uploadPath = localPath.resolveSibling(localPath.getFileName() + "-"
+                    + UUID.randomUUID() + ".zip");
+            SafeZipSupport.zipDirectory(localPath, uploadPath);
+        }
+        String localChecksum = SafeZipSupport.sha256(uploadPath);
 
-        // 2. 上传并取得填充了 objectKey + checksum 的 request
-        ArtifactStageRequest filled = restClient.post()
-                .uri("/internal/v1/artifacts/data")
-                .contentType(MediaType.MULTIPART_FORM_DATA)
-                .body(parts)
-                .retrieve()
-                .body(ArtifactStageRequest.class);
+        ArtifactStageRequest filled;
+        try {
+            MultiValueMap<String, Object> parts = createUploadParts(uploadPath, request);
+            filled = restClient.post()
+                    .uri("/internal/v1/artifacts/data")
+                    .contentType(MediaType.MULTIPART_FORM_DATA)
+                    .body(parts)
+                    .retrieve()
+                    .body(ArtifactStageRequest.class);
+        } finally {
+            if (temporaryArchive) {
+                deleteQuietly(uploadPath);
+            }
+        }
 
         if (filled == null) {
             throw new IllegalStateException("Upload returned null response");
+        }
+        if (!localChecksum.equals(filled.getChecksum())) {
+            throw new IllegalStateException("上传后的 Artifact 校验和不一致: expected="
+                    + localChecksum + ", actual=" + filled.getChecksum());
         }
 
         // 3. 保留原 request 的 format / storageType 等字段（服务端返回的是新实例）
@@ -191,28 +219,45 @@ public class RestClientArtifactClient implements ArtifactClient {
         return filled;
     }
 
-    /**
-     * 计算本地文件 SHA-256 checksum，格式 {@code sha256:hex}。
-     */
-    private String computeChecksum(Path file) {
-        try (InputStream in = Files.newInputStream(file)) {
-            MessageDigest sha256 = MessageDigest.getInstance("SHA-256");
-            byte[] buffer = new byte[8192];
-            int read;
-            while ((read = in.read(buffer)) != -1) {
-                sha256.update(buffer, 0, read);
-            }
-            return "sha256:" + bytesToHex(sha256.digest());
-        } catch (Exception e) {
-            throw new IllegalStateException("Failed to compute checksum: " + e.getMessage(), e);
+    private MultiValueMap<String, Object> createUploadParts(Path uploadPath,
+                                                             ArtifactStageRequest request) {
+        if (request.getExecutionContext() == null) {
+            throw new IllegalArgumentException("DAG Artifact 上传必须携带完整执行围栏");
         }
+        com.staterelay.contract.dag.algorithm.WorkerExecutionContext context =
+                request.getExecutionContext();
+        MultiValueMap<String, Object> parts = new LinkedMultiValueMap<>();
+        parts.add("file", new FileSystemResource(uploadPath));
+        parts.add("dagInstanceId", context.getDagInstanceId());
+        parts.add("nodeInstanceId", context.getNodeInstanceId());
+        parts.add("nodeCode", context.getNodeCode());
+        parts.add("attemptId", context.getAttemptId());
+        parts.add("attemptNo", context.getAttemptNo());
+        parts.add("outputKey", request.getOutputKey());
+        parts.add("requestId", context.getRequestId());
+        parts.add("requestChecksum", context.getRequestChecksum());
+        parts.add("dispatchGeneration", context.getDispatchGeneration());
+        parts.add("dispatchToken", context.getDispatchToken());
+        parts.add("attemptLeaseVersion", context.getAttemptLeaseVersion());
+        parts.add("workerId", context.getWorkerId());
+        parts.add("workerEpoch", context.getWorkerEpoch());
+        return parts;
     }
 
-    private static String bytesToHex(byte[] bytes) {
-        StringBuilder sb = new StringBuilder(bytes.length * 2);
-        for (byte b : bytes) {
-            sb.append(String.format("%02x", b));
+    private boolean isDirectoryArtifact(String format) {
+        if (format == null) {
+            return false;
         }
-        return sb.toString();
+        return "FILE_GDB".equalsIgnoreCase(format)
+                || "DIRECTORY".equalsIgnoreCase(format)
+                || format.toUpperCase(java.util.Locale.ROOT).endsWith("_DIRECTORY");
+    }
+
+    private void deleteQuietly(Path path) {
+        try {
+            Files.deleteIfExists(path);
+        } catch (IOException e) {
+            log.warning("清理临时 Artifact 文件失败: " + path + ", 原因: " + e.getMessage());
+        }
     }
 }

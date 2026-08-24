@@ -56,6 +56,7 @@ public final class ExecutionCoordinator implements AutoCloseable {
     private final WorkDirectoryManager workDirectoryManager;
     private final com.staterelay.contract.handler.spi.ArtifactClient artifactClient;
     private final com.staterelay.contract.handler.spi.ArtifactMetadataClient artifactMetadataClient;
+    private final RequestIdStore requestIdStore;
     private final ConcurrentHashMap<String, ExecuteTaskCommand> activeDispatches =
             new ConcurrentHashMap<>();
 
@@ -96,6 +97,24 @@ public final class ExecutionCoordinator implements AutoCloseable {
             WorkDirectoryManager workDirectoryManager,
             com.staterelay.contract.handler.spi.ArtifactClient artifactClient,
             com.staterelay.contract.handler.spi.ArtifactMetadataClient artifactMetadataClient) {
+        this(properties, identityProvider, handlers, objectMapper, store, reporter,
+                activityListener, clock, workDirectoryManager, artifactClient,
+                artifactMetadataClient, new InMemoryRequestIdStore());
+    }
+
+    public ExecutionCoordinator(
+            StateRelayProperties properties,
+            WorkerIdentityProvider identityProvider,
+            HandlerRegistry handlers,
+            ObjectMapper objectMapper,
+            LocalDispatchStore store,
+            ResultReporter reporter,
+            ActivityListener activityListener,
+            Clock clock,
+            WorkDirectoryManager workDirectoryManager,
+            com.staterelay.contract.handler.spi.ArtifactClient artifactClient,
+            com.staterelay.contract.handler.spi.ArtifactMetadataClient artifactMetadataClient,
+            RequestIdStore requestIdStore) {
         Objects.requireNonNull(properties, "properties");
         identity = Objects.requireNonNull(identityProvider, "identityProvider").identity();
         this.handlers = Objects.requireNonNull(handlers, "handlers");
@@ -107,6 +126,7 @@ public final class ExecutionCoordinator implements AutoCloseable {
         this.workDirectoryManager = workDirectoryManager;
         this.artifactClient = artifactClient;
         this.artifactMetadataClient = artifactMetadataClient;
+        this.requestIdStore = Objects.requireNonNull(requestIdStore, "requestIdStore");
         int maxConcurrency = requirePositive(properties.getMaxConcurrency(), "maxConcurrency");
         int queueCapacity = requireNonNegative(properties.getQueueCapacity(), "queueCapacity");
         deduplicator = new DispatchDeduplicator(store, maxConcurrency + queueCapacity);
@@ -133,6 +153,25 @@ public final class ExecutionCoordinator implements AutoCloseable {
                     "unknown handler: " + command.handlerName());
         }
 
+        boolean algorithmRequest = isAlgorithmRequest(command, binding);
+        if (algorithmRequest) {
+            try {
+                String requestId = requestId(command);
+                requestChecksum(command);
+                requestFence(command);
+                if (!(requestIdStore instanceof RequestIdStore.AtomicLifecycle)) {
+                    return ack(command, DispatchAck.AckStatus.REJECTED_HANDLER,
+                            "RequestIdStore does not provide atomic lifecycle operations");
+                }
+                if (requestIdStore.find(requestId).isPresent()) {
+                    return duplicateAlgorithm(command);
+                }
+            } catch (IllegalArgumentException exception) {
+                return ack(command, DispatchAck.AckStatus.REJECTED_HANDLER,
+                        exceptionMessage(exception));
+            }
+        }
+
         DispatchDeduplicator.Admission admission = deduplicator.tryAdmit(
                 command, identity, clock.instant());
         if (admission.status() == DispatchDeduplicator.AdmissionStatus.DUPLICATE) {
@@ -144,11 +183,29 @@ public final class ExecutionCoordinator implements AutoCloseable {
                     "local executor capacity is full");
         }
 
+        if (algorithmRequest) {
+            try {
+                if (!requestIdStore.tryStart(
+                        requestId(command), requestChecksum(command), requestFence(command),
+                        clock.instant())) {
+                    deduplicator.rollback(admission, command.dispatchId());
+                    return duplicateAlgorithm(command);
+                }
+            } catch (IllegalArgumentException | IllegalStateException exception) {
+                deduplicator.rollback(admission, command.dispatchId());
+                return ack(command, DispatchAck.AckStatus.REJECTED_HANDLER,
+                        exceptionMessage(exception));
+            }
+        }
+
         activeDispatches.put(command.dispatchId(), command);
         try {
             executor.execute(() -> runHandler(command, binding, admission));
         } catch (RuntimeException exception) {
             activeDispatches.remove(command.dispatchId(), command);
+            if (algorithmRequest) {
+                abortAlgorithmStart(command);
+            }
             deduplicator.rollback(admission, command.dispatchId());
             publishActivity();
             return ack(command, DispatchAck.AckStatus.REJECTED_CAPACITY,
@@ -169,33 +226,95 @@ public final class ExecutionCoordinator implements AutoCloseable {
             HandlerRegistry.HandlerBinding binding,
             DispatchDeduplicator.Admission admission) {
         Instant startedAt = clock.instant();
-        // DAG 场景：为 AlgorithmExecutor 创建独立工作目录（§14.1）
         WorkDirectory workDir = null;
         boolean isAlgorithm = binding.isAlgorithmExecutor()
                 && command.executionContext() != null
                 && workDirectoryManager != null;
-        if (isAlgorithm) {
-            WorkerExecutionContext ctx = command.executionContext();
-            workDir = workDirectoryManager.createWorkDirectory(
-                    ctx.getDagInstanceId(), ctx.getNodeCode(), ctx.getAttemptId());
-        }
+        boolean running = false;
+        boolean rolledBack = false;
         try {
+            // DAG 场景为每个 AlgorithmExecutor Attempt 创建独立工作目录（§14.1）。
+            if (isAlgorithm) {
+                WorkerExecutionContext ctx = command.executionContext();
+                workDir = workDirectoryManager.createWorkDirectory(
+                        ctx.getDagInstanceId(), ctx.getNodeCode(), ctx.getAttemptId());
+            }
             store.markRunning(command.dispatchId(), startedAt);
+            running = true;
             publishActivity();
             TaskResultReport report = executeToReport(command, binding, startedAt, workDir);
+            if (isAlgorithmRequest(command, binding)) {
+                report = persistAlgorithmTerminal(command, report);
+            }
             String checksum = LocalDispatchStore.checksum(objectMapper, report);
-            store.markTerminal(command.dispatchId(), report, checksum, report.finishedAt());
+            store.markTerminal(command.dispatchId(), report, checksum, report.getFinishedAt());
             reporter.completeAttempt(command.attemptId());
             reporter.reportTerminal(command.dispatchId());
+        } catch (Throwable throwable) {
+            if (!running) {
+                if (isAlgorithmRequest(command, binding)) {
+                    abortAlgorithmStart(command);
+                }
+                deduplicator.rollback(admission, command.dispatchId());
+                rolledBack = true;
+            } else {
+                finishUnexpectedFailure(command, binding, startedAt, throwable);
+            }
         } finally {
-            // 执行后清理工作目录（§19.4，best-effort）
+            // 执行后尽力清理工作目录，清理异常不得阻止释放本地容量（§19.4）。
             if (workDir != null) {
-                workDirectoryManager.cleanupWorkDirectory(
-                        workDir.dagInstanceId(), workDir.nodeCode(), workDir.attemptId());
+                try {
+                    workDirectoryManager.cleanupWorkDirectory(
+                            workDir.dagInstanceId(), workDir.nodeCode(), workDir.attemptId());
+                } catch (RuntimeException ignored) {
+                    // Task 4 负责工作目录残留的后续清理策略。
+                }
             }
             activeDispatches.remove(command.dispatchId(), command);
-            deduplicator.complete(admission);
+            if (!rolledBack) {
+                deduplicator.complete(admission);
+            }
             publishActivity();
+        }
+    }
+
+    private void abortAlgorithmStart(ExecuteTaskCommand command) {
+        requestIdStore.abortRunningStart(
+                requestId(command), requestChecksum(command), requestFence(command));
+    }
+
+    private void finishUnexpectedFailure(
+            ExecuteTaskCommand command,
+            HandlerRegistry.HandlerBinding binding,
+            Instant startedAt,
+            Throwable throwable) {
+        try {
+            TaskResultReport report = failure(
+                    command, "EXECUTION_COORDINATOR_FAILURE",
+                    exceptionMessage(throwable), startedAt);
+            if (isAlgorithmRequest(command, binding)) {
+                RequestIdStore.RequestIdRecord record = requestIdStore.find(requestId(command))
+                        .orElse(null);
+                if (record != null && record.state() == RequestIdStore.RequestState.RUNNING) {
+                    requestIdStore.markFailed(
+                            requestId(command), report.getErrorCode(), report.getErrorMessage(),
+                            report.getFinishedAt());
+                }
+                RequestIdStore.RequestIdRecord terminal = requestIdStore.find(requestId(command))
+                        .orElse(null);
+                if (terminal != null && terminal.state() != RequestIdStore.RequestState.RUNNING) {
+                    report = reportFromRecord(command, terminal);
+                }
+            }
+            LocalDispatchStore.DispatchRecord local = store.find(command.dispatchId()).orElse(null);
+            if (local != null && local.state() == LocalDispatchStore.DispatchState.RUNNING) {
+                String checksum = LocalDispatchStore.checksum(objectMapper, report);
+                store.markTerminal(command.dispatchId(), report, checksum, report.getFinishedAt());
+                reporter.completeAttempt(command.attemptId());
+                reporter.reportTerminal(command.dispatchId());
+            }
+        } catch (RuntimeException ignored) {
+            // 原始异常后的收敛失败由本地终态恢复与 Server 超时扫描继续处理。
         }
     }
 
@@ -221,7 +340,7 @@ public final class ExecutionCoordinator implements AutoCloseable {
                     && artifactClient != null && artifactMetadataClient != null) {
                 context = new DefaultAlgorithmExecutionContext(
                         command, identity, reporter, clock,
-                        workDir, artifactClient, artifactMetadataClient);
+                        workDir, artifactClient, artifactMetadataClient, requestIdStore);
             } else {
                 context = new DefaultTaskContext(
                         command, identity, reporter, clock);
@@ -274,6 +393,131 @@ public final class ExecutionCoordinator implements AutoCloseable {
                 identity.workerEpoch().toString(), status, message);
     }
 
+    private DispatchAck duplicateAlgorithm(ExecuteTaskCommand command) {
+        RequestIdStore.RequestIdRecord record;
+        try {
+            requestIdStore.tryStart(
+                    requestId(command), requestChecksum(command), requestFence(command),
+                    clock.instant());
+            record = requestIdStore.find(requestId(command)).orElseThrow();
+            validateDuplicateFence(record, command);
+        } catch (IllegalArgumentException | IllegalStateException exception) {
+            return ack(command, DispatchAck.AckStatus.REJECTED_HANDLER,
+                    exceptionMessage(exception));
+        }
+        if (record.state() == RequestIdStore.RequestState.SUCCESS
+                || record.state() == RequestIdStore.RequestState.FAILED) {
+            reporter.reportRecoveredTerminal(reportFromRecord(command, record));
+        }
+        return ack(command, DispatchAck.AckStatus.DUPLICATE,
+                "requestId was already admitted by the AlgorithmExecutor fence");
+    }
+
+    private TaskResultReport persistAlgorithmTerminal(
+            ExecuteTaskCommand command, TaskResultReport executed) {
+        String requestId = requestId(command);
+        if (executed.getTerminalStatus() == TaskResultReport.TerminalStatus.SUCCEEDED) {
+            requestIdStore.markSuccess(
+                    requestId,
+                    executed.getResult() == null ? "null" : executed.getResult().toString(),
+                    null,
+                    executed.getFinishedAt());
+        } else {
+            requestIdStore.markFailed(
+                    requestId, executed.getErrorCode(), executed.getErrorMessage(),
+                    executed.getFinishedAt());
+        }
+        return reportFromRecord(command, requestIdStore.find(requestId).orElseThrow());
+    }
+
+    private TaskResultReport reportFromRecord(
+            ExecuteTaskCommand command, RequestIdStore.RequestIdRecord record) {
+        WorkerExecutionContext context = latestContext(command.executionContext(), record);
+        JsonNode result = null;
+        if (record.state() == RequestIdStore.RequestState.SUCCESS
+                && record.resultJson() != null) {
+            try {
+                result = objectMapper.readTree(record.resultJson());
+            } catch (java.io.IOException exception) {
+                throw new IllegalStateException("stored terminal result is invalid JSON", exception);
+            }
+        }
+        TaskResultReport.TerminalStatus status = record.state() == RequestIdStore.RequestState.SUCCESS
+                ? TaskResultReport.TerminalStatus.SUCCEEDED
+                : TaskResultReport.TerminalStatus.FAILED;
+        return new TaskResultReport(
+                command.taskInstanceId(), command.attemptId(), record.leaseVersion(),
+                record.workerId(), record.workerEpoch(), status, result,
+                record.errorCode(), record.errorMessage(), record.createdAt(), record.updatedAt(),
+                context);
+    }
+
+    private static void validateDuplicateFence(
+            RequestIdStore.RequestIdRecord record, ExecuteTaskCommand command) {
+        WorkerExecutionContext context = command.executionContext();
+        Long attemptId = parseAttemptId(context.getAttemptId());
+        if (!Objects.equals(record.attemptId(), attemptId)
+                || !Objects.equals(record.workerId(), context.getWorkerId())
+                || !Objects.equals(record.workerEpoch(), context.getWorkerEpoch())
+                || !Objects.equals(record.leaseVersion(), context.getAttemptLeaseVersion())) {
+            throw new IllegalStateException("requestId is bound to another execution fence");
+        }
+    }
+
+    private static boolean isAlgorithmRequest(
+            ExecuteTaskCommand command, HandlerRegistry.HandlerBinding binding) {
+        return binding.isAlgorithmExecutor() && command.executionContext() != null;
+    }
+
+    private static String requestId(ExecuteTaskCommand command) {
+        String value = command.executionContext().getRequestId();
+        if (value == null || value.isBlank()) {
+            throw new IllegalArgumentException("AlgorithmExecutor requestId must not be blank");
+        }
+        return value;
+    }
+
+    private static String requestChecksum(ExecuteTaskCommand command) {
+        String value = command.executionContext().getRequestChecksum();
+        if (value == null || value.isBlank()) {
+            throw new IllegalArgumentException("AlgorithmExecutor requestChecksum must not be blank");
+        }
+        return value;
+    }
+
+    private static RequestIdStore.RequestFence requestFence(ExecuteTaskCommand command) {
+        WorkerExecutionContext context = command.executionContext();
+        return new RequestIdStore.RequestFence(
+                parseAttemptId(context.getAttemptId()), context.getWorkerId(),
+                context.getWorkerEpoch(), context.getAttemptLeaseVersion());
+    }
+
+    private static Long parseAttemptId(String value) {
+        try {
+            return Long.valueOf(value);
+        } catch (RuntimeException exception) {
+            throw new IllegalArgumentException("AlgorithmExecutor attemptId must be a number", exception);
+        }
+    }
+
+    private static WorkerExecutionContext latestContext(
+            WorkerExecutionContext source, RequestIdStore.RequestIdRecord record) {
+        WorkerExecutionContext context = new WorkerExecutionContext();
+        context.setDagInstanceId(source.getDagInstanceId());
+        context.setNodeInstanceId(source.getNodeInstanceId());
+        context.setNodeCode(source.getNodeCode());
+        context.setAttemptId(source.getAttemptId());
+        context.setAttemptNo(source.getAttemptNo());
+        context.setRequestId(source.getRequestId());
+        context.setRequestChecksum(record.requestChecksum());
+        context.setDispatchGeneration(source.getDispatchGeneration());
+        context.setDispatchToken(source.getDispatchToken());
+        context.setAttemptLeaseVersion(record.leaseVersion());
+        context.setWorkerId(record.workerId());
+        context.setWorkerEpoch(record.workerEpoch());
+        return context;
+    }
+
     private void publishActivity() {
         try {
             List<WorkerRegistrationClient.ExecutionLease> leases = activeDispatches.values()
@@ -283,8 +527,16 @@ public final class ExecutionCoordinator implements AutoCloseable {
                         String attemptId = dagExecution
                                 ? command.executionContext().getAttemptId()
                                 : command.attemptId();
+                        RequestIdStore.RequestIdRecord latest = dagExecution
+                                ? requestIdStore.find(command.executionContext().getRequestId())
+                                        .orElse(null)
+                                : null;
+                        long leaseVersion = latest == null
+                                ? command.leaseVersion() : latest.leaseVersion();
+                        UUID workerEpoch = latest == null
+                                ? identity.workerEpoch() : UUID.fromString(latest.workerEpoch());
                         return new WorkerRegistrationClient.ExecutionLease(
-                                attemptId, command.leaseVersion(), identity.workerEpoch(),
+                                attemptId, leaseVersion, workerEpoch,
                                 dagExecution ? ExecutionKind.DAG_NODE : ExecutionKind.GENERIC_TASK);
                     })
                     .toList();
@@ -292,7 +544,7 @@ public final class ExecutionCoordinator implements AutoCloseable {
                     executor.getActiveCount(), executor.getThreadPoolExecutor().getQueue().size(),
                     leases);
         } catch (RuntimeException ignored) {
-            // Activity reporting must not change local admission or execution outcomes.
+            // 活动上报不得改变本地准入或执行结果。
         }
     }
 

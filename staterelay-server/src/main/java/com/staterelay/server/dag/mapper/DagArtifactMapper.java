@@ -1,6 +1,7 @@
 package com.staterelay.server.dag.mapper;
 
 import com.staterelay.contract.dag.artifact.ArtifactMetadataResponse;
+import com.staterelay.contract.dag.algorithm.WorkerExecutionContext;
 import org.apache.ibatis.annotations.Mapper;
 import org.apache.ibatis.annotations.Param;
 
@@ -23,6 +24,12 @@ import java.util.List;
  */
 @Mapper
 public interface DagArtifactMapper {
+
+    /** 校验仍允许上传和登记成果的活跃执行围栏。 */
+    boolean matchesActiveFence(@Param("context") WorkerExecutionContext context);
+
+    /** 校验结果存储已经接受的成功权威执行围栏。 */
+    boolean matchesAcceptedSuccessFence(@Param("context") WorkerExecutionContext context);
 
     /**
      * 批量 CAS：STAGED(20) → AVAILABLE(30)，按当前权威 Attempt 精确推进（§16.2）。
@@ -92,4 +99,14 @@ public interface DagArtifactMapper {
      * CAS: DELETING(50) → DELETED(60)（物理删除完成，§19.4）。
      */
     int markDeletingAsDeleted(@Param("artifactId") Long artifactId, @Param("now") Instant now);
+
+    /** 仅晋升当前 Attempt 成功输出实际引用的 STAGED Artifact。 */
+    int promoteReferencedArtifacts(@Param("context") WorkerExecutionContext context,
+                                   @Param("artifactIds") List<Long> artifactIds,
+                                   @Param("now") Instant now);
+
+    /** 将指定 Attempt 尚未成为权威结果的 STAGED Artifact 幂等孤儿化。 */
+    int orphanUnreferencedArtifacts(@Param("context") WorkerExecutionContext context,
+                                    @Param("availableArtifactIds") List<Long> availableArtifactIds,
+                                    @Param("now") Instant now);
 }

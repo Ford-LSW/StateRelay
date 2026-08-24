@@ -1,6 +1,7 @@
 package com.staterelay.contract.dag.artifact;
 
 import com.fasterxml.jackson.annotation.JsonInclude;
+import com.staterelay.contract.dag.algorithm.WorkerExecutionContext;
 import com.staterelay.contract.dag.spatial.VectorStorageType;
 import lombok.Data;
 import lombok.NoArgsConstructor;
@@ -26,6 +27,12 @@ import java.util.Objects;
 @NoArgsConstructor
 @JsonInclude(JsonInclude.Include.NON_NULL)
 public class ArtifactStageRequest {
+
+    /**
+     * 本次上传所属的完整 DAG 执行围栏。
+     * 服务端在接收数据流和登记 STAGED 记录前都会重新校验该快照。
+     */
+    private WorkerExecutionContext executionContext;
 
     /** 所属 DAG 实例 ID（Worker 从 executionContext 取得） */
     private Long dagInstanceId;
@@ -61,6 +68,20 @@ public class ArtifactStageRequest {
         this.nodeCode = Objects.requireNonNull(nodeCode, "nodeCode");
         this.attemptId = Objects.requireNonNull(attemptId, "attemptId");
         this.attemptNo = Objects.requireNonNull(attemptNo, "attemptNo");
+        this.outputKey = Objects.requireNonNull(outputKey, "outputKey");
+        this.storageType = Objects.requireNonNull(storageType, "storageType");
+    }
+
+    /**
+     * 使用完整执行上下文创建登记请求，并同步保留旧协议中的归属字段。
+     */
+    public ArtifactStageRequest(WorkerExecutionContext executionContext, String outputKey,
+                                VectorStorageType storageType) {
+        this.executionContext = Objects.requireNonNull(executionContext, "executionContext");
+        this.dagInstanceId = executionContext.getDagInstanceId();
+        this.nodeCode = executionContext.getNodeCode();
+        this.attemptId = executionContext.getAttemptId();
+        this.attemptNo = executionContext.getAttemptNo();
         this.outputKey = Objects.requireNonNull(outputKey, "outputKey");
         this.storageType = Objects.requireNonNull(storageType, "storageType");
     }

@@ -4,6 +4,7 @@ import com.staterelay.contract.dag.artifact.ArtifactMetadataResponse;
 import com.staterelay.contract.dag.artifact.ArtifactStageRequest;
 import com.staterelay.contract.dag.artifact.ArtifactStageResponse;
 import com.staterelay.contract.dag.artifact.SpatialArtifactState;
+import com.staterelay.contract.dag.algorithm.WorkerExecutionContext;
 import com.staterelay.contract.dag.enums.DagArtifactType;
 import com.staterelay.server.dag.entity.DagArtifactEntity;
 import com.staterelay.server.dag.mapper.DagArtifactMapper;
@@ -18,6 +19,7 @@ import org.springframework.transaction.annotation.Transactional;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.file.Files;
+import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
@@ -26,6 +28,7 @@ import java.time.Instant;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.UUID;
 
 /**
  * 空间 Artifact 服务（对齐 GIS-Worker 设计文档 §15.1 / §16.1 / §16.2 / §19.4）。
@@ -82,11 +85,24 @@ public class SpatialArtifactService {
      */
     @Transactional(propagation = Propagation.REQUIRES_NEW)
     public ArtifactStageResponse stageArtifact(ArtifactStageRequest request) {
-        Objects.requireNonNull(request, "request");
-        Objects.requireNonNull(request.getDagInstanceId(), "dagInstanceId");
-        Objects.requireNonNull(request.getNodeCode(), "nodeCode");
-        Objects.requireNonNull(request.getAttemptId(), "attemptId");
-        Objects.requireNonNull(request.getOutputKey(), "outputKey");
+        WorkerExecutionContext context = requireCurrentFence(request);
+        validateIdentifier(request.getOutputKey(), "outputKey");
+        synchronizeOwnership(request, context);
+        verifyUploadedObject(request);
+        if (!artifactMapper.matchesActiveFence(context)) {
+            throw new IllegalStateException("登记 Artifact 时执行围栏已失效");
+        }
+
+        Optional<DagArtifactEntity> existing = artifactRepository
+                .findByAttemptIdAndOutputName(context.getAttemptId(), request.getOutputKey());
+        if (existing.isPresent()) {
+            DagArtifactEntity artifact = existing.get();
+            if (!Objects.equals(artifact.getChecksum(), request.getChecksum())
+                    || !Objects.equals(artifact.getObjectKey(), request.getObjectKey())) {
+                throw new IllegalStateException("同一 Attempt 输出已使用不同内容登记");
+            }
+            return new ArtifactStageResponse(artifact.getId(), artifact.getStatus());
+        }
 
         Instant now = Instant.now();
         DagArtifactEntity entity = new DagArtifactEntity();
@@ -102,6 +118,13 @@ public class SpatialArtifactService {
         entity.setChecksum(request.getChecksum());
         entity.setAttemptId(request.getAttemptId());
         entity.setAttemptNo(request.getAttemptNo());
+        entity.setRequestId(context.getRequestId());
+        entity.setRequestChecksum(context.getRequestChecksum());
+        entity.setDispatchGeneration(context.getDispatchGeneration());
+        entity.setDispatchToken(context.getDispatchToken());
+        entity.setAttemptLeaseVersion(context.getAttemptLeaseVersion());
+        entity.setWorkerId(context.getWorkerId());
+        entity.setWorkerEpoch(context.getWorkerEpoch());
         entity.setCreatedAt(now);
         entity.setUpdatedAt(now);
 
@@ -240,31 +263,146 @@ public class SpatialArtifactService {
      */
     public ArtifactStageRequest uploadDataStream(InputStream inputStream, ArtifactStageRequest request) {
         Objects.requireNonNull(inputStream, "inputStream");
-        Objects.requireNonNull(request, "request");
+        WorkerExecutionContext context = requireCurrentFence(request);
+        validateIdentifier(request.getOutputKey(), "outputKey");
+        synchronizeOwnership(request, context);
+        Path temporary = null;
         try {
             String objectKey = generateObjectKey(request);
             Path target = resolveObjectKey(objectKey);
             Files.createDirectories(target.getParent());
+            temporary = target.resolveSibling(target.getFileName() + ".upload-" + UUID.randomUUID());
             MessageDigest sha256 = MessageDigest.getInstance("SHA-256");
-            long bytes = copyWithDigest(inputStream, target, sha256);
+            long bytes = copyWithDigest(inputStream, temporary, sha256);
             String checksum = "sha256:" + bytesToHex(sha256.digest());
+            if (!artifactMapper.matchesActiveFence(context)) {
+                Files.deleteIfExists(temporary);
+                throw new IllegalStateException("上传完成时执行围栏已失效");
+            }
+            publishUploadedObject(temporary, target, checksum);
+            temporary = null;
             request.setObjectKey(objectKey);
             request.setChecksum(checksum);
             log.info("Artifact data uploaded: objectKey={}, checksum={}, bytes={}", objectKey, checksum, bytes);
             return request;
         } catch (Exception e) {
+            if (temporary != null) {
+                try {
+                    Files.deleteIfExists(temporary);
+                } catch (IOException cleanupError) {
+                    e.addSuppressed(cleanupError);
+                }
+            }
             throw new IllegalStateException("Failed to upload artifact data: " + e.getMessage(), e);
         }
     }
 
+    /** 原子发布上传对象；同一 Attempt 的重复上传只允许内容完全一致。 */
+    private void publishUploadedObject(Path temporary, Path target, String checksum)
+            throws IOException {
+        if (Files.exists(target)) {
+            if (!Objects.equals(checksum(target), checksum)) {
+                throw new IllegalStateException("同一 Attempt 输出禁止覆盖为不同内容");
+            }
+            Files.deleteIfExists(temporary);
+            return;
+        }
+        try {
+            Files.move(temporary, target, java.nio.file.StandardCopyOption.ATOMIC_MOVE);
+        } catch (AtomicMoveNotSupportedException exception) {
+            Files.move(temporary, target);
+        } catch (java.nio.file.FileAlreadyExistsException exception) {
+            if (!Objects.equals(checksum(target), checksum)) {
+                throw new IllegalStateException("并发上传的同一 Attempt 输出内容不一致", exception);
+            }
+            Files.deleteIfExists(temporary);
+        }
+    }
+
     private Path resolveObjectKey(String objectKey) {
-        return storageBaseDir.resolve(objectKey);
+        Path resolved = storageBaseDir.resolve(objectKey).normalize();
+        if (!resolved.startsWith(storageBaseDir)) {
+            throw new IllegalArgumentException("Artifact objectKey 超出存储根目录");
+        }
+        return resolved;
     }
 
     private String generateObjectKey(ArtifactStageRequest request) {
-        return String.format("dag/%d/%s/attempt-%s/%s",
+        return String.format("dag/%d/%s/attempt-%s/%s.bin",
             request.getDagInstanceId(), request.getNodeCode(),
             request.getAttemptId(), request.getOutputKey());
+    }
+
+    /** 校验待登记对象确实由当前 Attempt 上传，且物理内容摘要未被替换。 */
+    private void verifyUploadedObject(ArtifactStageRequest request) {
+        String expectedKey = generateObjectKey(request);
+        if (!Objects.equals(expectedKey, request.getObjectKey())) {
+            throw new IllegalArgumentException("objectKey 不属于当前 Attempt 输出");
+        }
+        Path object = resolveObjectKey(expectedKey);
+        if (!Files.isRegularFile(object)) {
+            throw new IllegalStateException("待登记的 Artifact 数据不存在");
+        }
+        String actualChecksum = checksum(object);
+        if (!Objects.equals(actualChecksum, request.getChecksum())) {
+            throw new IllegalStateException("Artifact checksum 与已上传内容不一致");
+        }
+    }
+
+    /** 计算服务端存储对象的 SHA-256 摘要。 */
+    private String checksum(Path path) {
+        try (InputStream input = Files.newInputStream(path)) {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            byte[] buffer = new byte[8192];
+            int read;
+            while ((read = input.read(buffer)) >= 0) {
+                if (read > 0) {
+                    digest.update(buffer, 0, read);
+                }
+            }
+            return "sha256:" + bytesToHex(digest.digest());
+        } catch (Exception exception) {
+            throw new IllegalStateException("无法校验 Artifact checksum", exception);
+        }
+    }
+
+    /** 校验请求携带的完整 DAG 执行围栏仍为当前权威执行。 */
+    private WorkerExecutionContext requireCurrentFence(ArtifactStageRequest request) {
+        Objects.requireNonNull(request, "request");
+        WorkerExecutionContext context = Objects.requireNonNull(
+                request.getExecutionContext(), "executionContext");
+        Objects.requireNonNull(context.getDagInstanceId(), "dagInstanceId");
+        Objects.requireNonNull(context.getNodeInstanceId(), "nodeInstanceId");
+        validateIdentifier(context.getNodeCode(), "nodeCode");
+        validateIdentifier(context.getAttemptId(), "attemptId");
+        Objects.requireNonNull(context.getAttemptNo(), "attemptNo");
+        Objects.requireNonNull(context.getRequestId(), "requestId");
+        Objects.requireNonNull(context.getRequestChecksum(), "requestChecksum");
+        Objects.requireNonNull(context.getDispatchGeneration(), "dispatchGeneration");
+        Objects.requireNonNull(context.getDispatchToken(), "dispatchToken");
+        Objects.requireNonNull(context.getAttemptLeaseVersion(), "attemptLeaseVersion");
+        Objects.requireNonNull(context.getWorkerId(), "workerId");
+        Objects.requireNonNull(context.getWorkerEpoch(), "workerEpoch");
+        if (!artifactMapper.matchesActiveFence(context)) {
+            throw new IllegalStateException("Artifact 执行围栏不匹配或 DAG 已不再运行");
+        }
+        return context;
+    }
+
+    /** 以完整执行上下文覆盖可由旧客户端单独传入的归属字段。 */
+    private void synchronizeOwnership(ArtifactStageRequest request,
+                                      WorkerExecutionContext context) {
+        request.setDagInstanceId(context.getDagInstanceId());
+        request.setNodeCode(context.getNodeCode());
+        request.setAttemptId(context.getAttemptId());
+        request.setAttemptNo(context.getAttemptNo());
+    }
+
+    /** 限制路径组成字段只能使用安全的物理名称字符。 */
+    private void validateIdentifier(String value, String field) {
+        if (value == null || !value.matches("[A-Za-z0-9_-]{1,128}")) {
+            throw new IllegalArgumentException(field + " 含有非法字符");
+        }
     }
 
     private long copyWithDigest(InputStream in, Path target, MessageDigest digest) throws IOException {

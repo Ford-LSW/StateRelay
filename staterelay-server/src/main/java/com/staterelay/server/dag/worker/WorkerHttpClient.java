@@ -23,7 +23,7 @@ import com.staterelay.contract.protocol.ExecuteTaskCommand;
  */
 public interface WorkerHttpClient {
 
-    /** Sends one concrete DAG execution command to the selected Worker. */
+    /** 向选定 Worker 发送一条具体的 DAG 执行命令。 */
     DispatchAck execute(String workerAddress, ExecuteTaskCommand command);
 
     /**

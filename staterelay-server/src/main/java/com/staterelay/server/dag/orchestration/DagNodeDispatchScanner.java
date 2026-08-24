@@ -58,7 +58,7 @@ public class DagNodeDispatchScanner {
         this.transportRetryBatchSize = transportRetryBatchSize;
     }
 
-    /** Retransmits ACK-uncertain HTTP sends without creating another Attempt. */
+    /** 重发 ACK 状态不确定的 HTTP 请求，不创建新的执行尝试。 */
     @Scheduled(fixedDelayString = "${staterelay.dag.dispatch.transport-retry-scan-interval-ms:1000}")
     public void retryUncertainDispatches() {
         try {
